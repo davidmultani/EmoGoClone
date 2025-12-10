@@ -27,6 +27,11 @@
   14. Jumping eyeballs with beat detection
   15. Web configuration server
   16. Non-blocking WiFi connection
+  17. Alarm System with Web Configuration
+  18. Smooth Eye Color Transitions
+  19. Lip Animation with Music Sync
+  20. Weather Display
+  21. Particle Effects System
 */
 
 #include <Arduino.h>
@@ -40,6 +45,7 @@
 #include <esp_wifi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <HTTPClient.h>
 
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
@@ -48,8 +54,8 @@
 #include <driver/i2s.h>
 
 // ----------------- WiFi Configuration ------------------
-#define WIFI_SSID "Your-WIFI-SSID" // optional. You can configure in the UI
-#define WIFI_PASSWORD "Your-WIFI-Password"  // optional. You can configure in the UI
+#define WIFI_SSID "Your-WIFI-SSID"
+#define WIFI_PASSWORD "Your-WIFI-Password"
 
 #define WIFI_SSID2 ""
 #define WIFI_PASSWORD2 ""
@@ -101,6 +107,10 @@ bool web_server_active = false;
 String ap_ssid = "EmoFacePro-AP";
 String ap_password = "12345678";
 
+// ================== Alarm System Config =================
+#define MAX_ALARMS 5
+
+// ================== Hardware Pins =================
 static const int I2C_SDA = 32;
 static const int I2C_SCL = 33;
 
@@ -114,7 +124,7 @@ static int BLINK_OFS_Y = -12;
 
 // Web configurable settings
 static struct {
-  int music_sensitivity = 8;  // 1-10 scale
+  int music_sensitivity = 8;
   float mic_gain = 0.5f;
   int eyebrow_dance_speed = 8;
   int eyeball_jump_strength = 12;
@@ -126,7 +136,17 @@ static struct {
   String timezone = "IST-5:30";
   int sleep_hour = 23;
   int wake_hour = 7;
-  int brightness = 255; 
+  int brightness = 255;
+  
+  // New settings
+  float color_transition_speed = 0.02f;
+  bool lip_sync_enabled = true;
+  int lip_sync_sensitivity = 5;
+  bool weather_enabled = false;
+  String weather_api_key = "";
+  String weather_city = "London";
+  bool notifications_enabled = true;
+  int alarm_volume = 7;
 } config;
 
 static const long  GMT_OFFSET_SEC = 5.5 * 3600;
@@ -175,6 +195,50 @@ static const uint32_t LVGL_UPDATE_MS = 20;
 static const uint32_t POWER_SAVE_TIMEOUT = 300000;
 static const uint32_t WIFI_CONNECT_TIMEOUT = 10000;  
 static const uint32_t WIFI_RETRY_INTERVAL = 60000;  
+
+// ================== Alarm System ==================
+struct Alarm {
+  bool enabled;
+  int hour;
+  int minute;
+  int days[7]; // 0=Sun, 1=Mon, ..., 6=Sat
+  String label;
+  int type; // 0=gentle, 1=standard, 2=energetic
+  bool snoozed;
+  int snooze_minutes;
+};
+
+static Alarm alarms[MAX_ALARMS];
+static bool alarm_triggered = false;
+static int current_alarm_index = -1;
+static uint32_t alarm_start_time = 0;
+static uint32_t last_alarm_check = 0;
+static lv_obj_t *alarm_label = nullptr;
+
+// ================== Smooth Color Transition ==================
+static lv_color_t current_eye_color = COL_EYE[EMO_NORMAL];
+static lv_color_t target_eye_color = COL_EYE[EMO_NORMAL];
+static float color_transition_progress = 1.0f;
+
+// ================== Lip Animation ==================
+static lv_obj_t *mouth_top = nullptr;
+static lv_obj_t *mouth_bottom = nullptr;
+static float lip_openness = 0.5f;
+static uint32_t last_lip_update = 0;
+
+// ================== Weather Display ==================
+#if ENABLE_WIFI
+static String weather_temp = "--";
+static String weather_condition = "";
+static uint32_t last_weather_update = 0;
+static const uint32_t WEATHER_UPDATE_INTERVAL = 1800000;
+static lv_obj_t *weather_label = nullptr;
+#endif
+
+// ================== Particle System ==================
+static lv_obj_t *particles[20];
+static bool particles_active = false;
+static uint32_t particle_last_update = 0;
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 _panel;
@@ -270,7 +334,6 @@ struct Eye {
   float k=0.3f, d=0.8f, vx=0, vy=0;
   int x=0, y=0;
   
-  // Music reaction variables
   float music_dx = 0;
   float music_dy = 0;
   uint32_t last_beat_time = 0;
@@ -307,7 +370,6 @@ struct Eye {
           center_y + pupil_dy - 4);
     }
     
-    // Decay music effects
     music_dx *= beat_decay;
     music_dy *= beat_decay;
     
@@ -388,7 +450,6 @@ static uint32_t last_beat_time = 0;
 static float beat_bpm = 0;
 static bool beat_detected = false;
 
-// Music reaction variables
 static float music_dance_phase = 0;
 static float music_dance_intensity = 0;
 static uint32_t last_music_update = 0;
@@ -426,7 +487,6 @@ static uint32_t tts_next_char_time = 0;
 
 // ================== FORWARD DECLARATIONS ==================
 static void playTone(float freq, int ms, float vol = 0.35f);
-static void updateMouthForEmotion(Emotion e);
 static void set_emotion(Emotion emo, bool proofBlink = true);
 static void enhancedSetEmotion(Emotion emo, bool withVoice = true, bool immediate = false);
 static void updateMoodMemory(Emotion e, float intensity);
@@ -435,15 +495,15 @@ static void calibrateAccelerometerZero();
 static void calibrateBlinkOffset();
 static void autoCalibrateBlink();
 static void initTime();
-static void updateTTS();
 
-// Forward declarations for time functions
+// Time functions
 #if ENABLE_TIME_FEATURES
 static int getCurrentHour();
 static int getCurrentMinute();
 static String getCurrentTimeString();
 #endif
 
+// Web server functions
 #if ENABLE_WEB_SERVER
 static void updateBrightness();
 static void saveConfig();
@@ -461,6 +521,46 @@ static void handleTestBrightness();
 static void handleTestBrightnessRestore();
 static void handleReconnectWiFi();
 static void handleFactoryReset();
+#endif
+
+// New feature functions
+static void initAlarmSystem();
+static void saveAlarms();
+static void loadAlarms();
+static void checkAlarms();
+static void triggerAlarm(int alarm_index);
+static void stopAlarm();
+static void snoozeAlarm();
+static String getNextAlarmTime();
+static int countActiveAlarms();
+
+static void smoothEyeColorTransition();
+static lv_color_t interpolateColor(lv_color_t c1, lv_color_t c2, float ratio);
+static void update_eye_color();
+
+static void initLipAnimation();
+static void updateLipAnimation(float loudness, bool beat_detected);
+static void setLipShapeForEmotion(Emotion e);
+static void lipSyncToMusic(float loudness, float bpm);
+
+#if ENABLE_WIFI
+static void initWeatherDisplay();
+static void updateWeather();
+static void fetchWeatherData();
+#endif
+
+static void initParticleSystem();
+static void updateParticles(Emotion e);
+static void spawnParticles(int x, int y, int count, lv_color_t color);
+
+// Web server handlers for new features
+#if ENABLE_WEB_SERVER
+static void handleAlarms();
+static void handleSaveAlarm();
+static void handleDeleteAlarm();
+static void handleTestAlarm();
+static void handleWeatherSettings();
+static void handleSaveWeatherSettings();
 #endif
 
 static inline void set_top_lid(void *obj, int32_t v) {
@@ -614,17 +714,62 @@ static void blink_eyes(uint16_t t) {
   (void)done;
 }
 
+// ================== SMOOTH EYE COLOR TRANSITION ==================
 static void update_eye_color() {
-  lv_color_t from=COL_EYE[prev_emotion], to=COL_EYE[target_emotion];
-  uint8_t mix = (uint8_t)(emotion_blend*255.0f);
-  lv_color_t blended = lv_color_mix(to, from, mix);
-  lv_style_set_bg_color(&style_eye, blended);
-  lv_style_set_shadow_color(&style_eye, blended);
+  if (color_transition_progress < 1.0f) {
+    color_transition_progress += config.color_transition_speed;
+    if (color_transition_progress > 1.0f) color_transition_progress = 1.0f;
+    
+    current_eye_color = interpolateColor(current_eye_color, target_eye_color, 
+                                         color_transition_progress);
+  }
+  
+  lv_style_set_bg_color(&style_eye, current_eye_color);
+  lv_style_set_shadow_color(&style_eye, current_eye_color);
   lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
   lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-  lv_style_set_line_color(&style_brow, blended);
+  
+  lv_style_set_line_color(&style_brow, current_eye_color);
   lv_obj_refresh_style(eyeL.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
   lv_obj_refresh_style(eyeR.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+}
+
+static lv_color_t interpolateColor(lv_color_t c1, lv_color_t c2, float ratio) {
+  if (ratio <= 0.0f) return c1;
+  if (ratio >= 1.0f) return c2;
+  
+  uint8_t r1 = (c1.full >> 11) & 0x1F;
+  uint8_t g1 = (c1.full >> 5) & 0x3F;
+  uint8_t b1 = c1.full & 0x1F;
+  
+  uint8_t r2 = (c2.full >> 11) & 0x1F;
+  uint8_t g2 = (c2.full >> 5) & 0x3F;
+  uint8_t b2 = c2.full & 0x1F;
+  
+  uint8_t r = (uint8_t)(r1 + (r2 - r1) * ratio);
+  uint8_t g = (uint8_t)(g1 + (g2 - g1) * ratio);
+  uint8_t b = (uint8_t)(b1 + (b2 - b1) * ratio);
+  
+  return lv_color_make(r << 3, g << 2, b << 3);
+}
+
+static void smoothEyeColorTransition() {
+  if (color_transition_progress < 1.0f) {
+    color_transition_progress += config.color_transition_speed;
+    if (color_transition_progress > 1.0f) color_transition_progress = 1.0f;
+    
+    current_eye_color = interpolateColor(current_eye_color, target_eye_color, 
+                                         color_transition_progress);
+    
+    lv_style_set_bg_color(&style_eye, current_eye_color);
+    lv_style_set_shadow_color(&style_eye, current_eye_color);
+    lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+    lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+    
+    lv_style_set_line_color(&style_brow, current_eye_color);
+    lv_obj_refresh_style(eyeL.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+    lv_obj_refresh_style(eyeR.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  }
 }
 
 static uint16_t blinkDurationForEmotion(Emotion e) {
@@ -669,10 +814,13 @@ static void set_emotion(Emotion emo, bool proofBlink) {
   
   if (millis() - emotion_stable_since < 1000) return;
   
-  prev_emotion=current_emotion; 
-  target_emotion=emo; 
-  current_emotion=emo; 
-  emotion_blend=0.0f;
+  prev_emotion = current_emotion; 
+  target_emotion = emo; 
+  current_emotion = emo;
+  
+  target_eye_color = COL_EYE[emo];
+  color_transition_progress = 0.0f;
+  
   last_stable_emotion = emo;
   emotion_stable_since = millis();
   last_activity_time = millis();
@@ -687,6 +835,7 @@ static void set_emotion(Emotion emo, bool proofBlink) {
     default:          eyeL.setTarget(0,0);  eyeR.setTarget(0,0);  eyeL.setPupilSize(12,12); eyeR.setPupilSize(12,12); set_brow_line(eyeL,0);  set_brow_line(eyeR, 0); break;
   }
   
+  setLipShapeForEmotion(emo);
   update_eye_color();
   scheduleNextBlink();
   if (proofBlink) nextBlinkAt = millis() + 400;
@@ -714,10 +863,21 @@ static void saveConfig() {
   preferences.putString("timezone", config.timezone);
   preferences.putInt("sleep_hour", config.sleep_hour);
   preferences.putInt("wake_hour", config.wake_hour);
-  preferences.putInt("brightness", config.brightness);  // Save brightness
+  preferences.putInt("brightness", config.brightness);
+  
+  // New settings
+  preferences.putFloat("color_speed", config.color_transition_speed);
+  preferences.putBool("lip_sync", config.lip_sync_enabled);
+  preferences.putInt("lip_sens", config.lip_sync_sensitivity);
+  preferences.putBool("weather_en", config.weather_enabled);
+  preferences.putString("weather_key", config.weather_api_key);
+  preferences.putString("weather_city", config.weather_city);
+  preferences.putBool("notifications", config.notifications_enabled);
+  preferences.putInt("alarm_vol", config.alarm_volume);
+  
   preferences.end();
   
-  updateBrightness();  // Apply brightness immediately
+  updateBrightness();
 }
 
 static void loadConfig() {
@@ -725,7 +885,7 @@ static void loadConfig() {
   config.music_sensitivity = preferences.getInt("music_sens", 8);
   config.mic_gain = preferences.getFloat("mic_gain", 0.5f);
   config.eyebrow_dance_speed = preferences.getInt("eyebrow_speed", 8);
-  config.eyeball_jump_strength = preferences.getInt("eyebrow_speed", 12);
+  config.eyeball_jump_strength = preferences.getInt("eyeball_str", 12);
   config.auto_emotion = preferences.getBool("auto_emo", true);
   config.voice_reactions = preferences.getBool("voice_react", true);
   config.music_reactions = preferences.getBool("music_react", true);
@@ -734,13 +894,23 @@ static void loadConfig() {
   config.timezone = preferences.getString("timezone", "IST-5:30");
   config.sleep_hour = preferences.getInt("sleep_hour", 23);
   config.wake_hour = preferences.getInt("wake_hour", 7);
-  config.brightness = preferences.getInt("brightness", 255);  // Load brightness
+  config.brightness = preferences.getInt("brightness", 255);
+  
+  // New settings
+  config.color_transition_speed = preferences.getFloat("color_speed", 0.02f);
+  config.lip_sync_enabled = preferences.getBool("lip_sync", true);
+  config.lip_sync_sensitivity = preferences.getInt("lip_sens", 5);
+  config.weather_enabled = preferences.getBool("weather_en", false);
+  config.weather_api_key = preferences.getString("weather_key", "");
+  config.weather_city = preferences.getString("weather_city", "London");
+  config.notifications_enabled = preferences.getBool("notifications", true);
+  config.alarm_volume = preferences.getInt("alarm_vol", 7);
+  
   preferences.end();
   
-  // Apply loaded settings
   SLEEP_HOUR = config.sleep_hour;
   WAKE_HOUR = config.wake_hour;
-  updateBrightness();  // Apply brightness
+  updateBrightness();
 }
 
 static void handleRoot() {
@@ -773,6 +943,8 @@ static void handleRoot() {
   html += ".status p{margin:10px 0;font-size:1.1em;}";
   html += ".actions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}";
   html += ".emoji-icon{font-size:1.5em;margin-right:10px;}";
+  html += ".alarm-status{background:linear-gradient(135deg,#fff3cd 0%,#ffeaa7 100%);padding:15px;border-radius:8px;margin:15px 0;border:2px solid #ffc107;}";
+  html += ".alarm-item{padding:10px;background:#f8f9fa;border-radius:5px;margin:5px 0;border-left:4px solid #667eea;}";
   html += "@media (max-width:600px){.container{padding:15px;} h1{font-size:2em;} .actions-grid{grid-template-columns:1fr;}}";
   html += "</style>";
   html += "</head><body>";
@@ -801,6 +973,20 @@ static void handleRoot() {
   html += "<p><strong>Brightness:</strong> ";
   html += String(config.brightness);
   html += "%</p>";
+  
+  // Alarm status
+  html += "<div class='alarm-status'>";
+  html += "<p><strong>Alarm Status:</strong> ";
+  html += alarm_triggered ? "🔔 Ringing" : "✅ Quiet";
+  html += "</p>";
+  html += "<p><strong>Next Alarm:</strong> ";
+  html += getNextAlarmTime();
+  html += "</p>";
+  html += "<p><strong>Active Alarms:</strong> ";
+  html += String(countActiveAlarms());
+  html += "</p>";
+  html += "</div>";
+  
   html += "</div>";
   html += "</div>";
   
@@ -834,6 +1020,16 @@ static void handleRoot() {
   html += String(config.brightness);
   html += "' oninput=\"brightnessValue.innerHTML=this.value+'%'\">";
   html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Color Transition Speed: <span class='range-value' id='colorSpeedValue'>";
+  html += String(config.color_transition_speed, 2);
+  html += "</span></label>";
+  html += "<div class='range-container'>";
+  html += "<span>Slow</span><input type='range' name='color_speed' min='0.01' max='0.1' step='0.01' value='";
+  html += String(config.color_transition_speed, 2);
+  html += "' oninput=\"colorSpeedValue.innerHTML=parseFloat(this.value).toFixed(2)\"><span>Fast</span>";
+  html += "</div>";
+  html += "</div>";
   html += "</div>";
   
   // Music Reaction Settings
@@ -851,11 +1047,11 @@ static void handleRoot() {
   html += "</div>";
   html += "<div class='form-group'>";
   html += "<label>Microphone Gain: <span class='range-value' id='gainValue'>";
-  html += String(config.mic_gain);
+  html += String(config.mic_gain, 1);
   html += "</span></label>";
   html += "<input type='range' name='mic_gain' min='0.1' max='2.0' step='0.1' value='";
-  html += String(config.mic_gain);
-  html += "' oninput=\"gainValue.innerHTML=this.value\">";
+  html += String(config.mic_gain, 1);
+  html += "' oninput=\"gainValue.innerHTML=parseFloat(this.value).toFixed(1)\">";
   html += "</div>";
   html += "<div class='form-group'>";
   html += "<label>Eyebrow Dance Speed: <span class='range-value' id='eyebrowValue'>";
@@ -872,6 +1068,16 @@ static void handleRoot() {
   html += "<input type='range' name='eyeball_strength' min='1' max='20' value='";
   html += String(config.eyeball_jump_strength);
   html += "' oninput=\"eyeballValue.innerHTML=this.value\">";
+  html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Lip Sync Sensitivity: <span class='range-value' id='lipSyncValue'>";
+  html += String(config.lip_sync_sensitivity);
+  html += "</span></label>";
+  html += "<div class='range-container'>";
+  html += "<span>Low</span><input type='range' name='lip_sync_sensitivity' min='1' max='10' value='";
+  html += String(config.lip_sync_sensitivity);
+  html += "' oninput=\"lipSyncValue.innerHTML=this.value\"><span>High</span>";
+  html += "</div>";
   html += "</div>";
   html += "</div>";
   
@@ -896,33 +1102,39 @@ static void handleRoot() {
   html += ">";
   html += "<label for='music_reactions'>Music Reactions</label>";
   html += "</div>";
+  html += "<div class='checkbox-group'>";
+  html += "<input type='checkbox' id='lip_sync_enabled' name='lip_sync_enabled' ";
+  html += config.lip_sync_enabled ? "checked" : "";
+  html += ">";
+  html += "<label for='lip_sync_enabled'>Lip Sync Animation</label>";
+  html += "</div>";
+  html += "<div class='checkbox-group'>";
+  html += "<input type='checkbox' id='notifications_enabled' name='notifications_enabled' ";
+  html += config.notifications_enabled ? "checked" : "";
+  html += ">";
+  html += "<label for='notifications_enabled'>Notifications</label>";
+  html += "</div>";
   html += "<div class='form-group'>";
   html += "<label for='timezone'>Timezone:</label>";
   html += "<select id='timezone' name='timezone'>";
   html += "<option value='IST-5:30'";
   if (config.timezone == "IST-5:30") html += " selected";
   html += ">IST (India)</option>";
-  
   html += "<option value='EST+5:00'";
   if (config.timezone == "EST+5:00") html += " selected";
   html += ">EST (USA East)</option>";
-  
   html += "<option value='PST+8:00'";
   if (config.timezone == "PST+8:00") html += " selected";
   html += ">PST (USA West)</option>";
-  
   html += "<option value='GMT+0:00'";
   if (config.timezone == "GMT+0:00") html += " selected";
   html += ">GMT (London)</option>";
-  
   html += "<option value='CET-1:00'";
   if (config.timezone == "CET-1:00") html += " selected";
   html += ">CET (Europe)</option>";
-  
   html += "<option value='JST-9:00'";
   if (config.timezone == "JST-9:00") html += " selected";
   html += ">JST (Japan)</option>";
-  
   html += "</select>";
   html += "</div>";
   html += "<div class='form-group'>";
@@ -937,6 +1149,44 @@ static void handleRoot() {
   html += String(config.wake_hour);
   html += "'>";
   html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Alarm Volume: <span class='range-value' id='alarmVolValue'>";
+  html += String(config.alarm_volume);
+  html += "</span></label>";
+  html += "<div class='range-container'>";
+  html += "<span>Quiet</span><input type='range' name='alarm_volume' min='1' max='10' value='";
+  html += String(config.alarm_volume);
+  html += "' oninput=\"alarmVolValue.innerHTML=this.value\"><span>Loud</span>";
+  html += "</div>";
+  html += "</div>";
+  html += "</div>";
+  
+  // Weather Settings
+  html += "<div class='section'>";
+  html += "<h2>🌤️ Weather Settings</h2>";
+  html += "<div class='checkbox-group'>";
+  html += "<input type='checkbox' id='weather_enabled' name='weather_enabled' ";
+  html += config.weather_enabled ? "checked" : "";
+  html += " onchange='toggleWeatherFields(this.checked)'>";
+  html += "<label for='weather_enabled'>Enable Weather Display</label>";
+  html += "</div>";
+  html += "<div class='form-group' id='weatherFields' style='";
+  if (!config.weather_enabled) html += "display:none;";
+  html += "'>";
+  html += "<label for='weather_api_key'>OpenWeatherMap API Key:</label>";
+  html += "<input type='text' id='weather_api_key' name='weather_api_key' value='";
+  html += config.weather_api_key;
+  html += "' placeholder='Enter API key'>";
+  html += "<small>Get free API key from openweathermap.org</small>";
+  html += "</div>";
+  html += "<div class='form-group' id='weatherCityField' style='";
+  if (!config.weather_enabled) html += "display:none;";
+  html += "'>";
+  html += "<label for='weather_city'>City:</label>";
+  html += "<input type='text' id='weather_city' name='weather_city' value='";
+  html += config.weather_city;
+  html += "' placeholder='e.g., London, New York'>";
+  html += "</div>";
   html += "</div>";
   
   html += "<div class='form-group' style='text-align:center;'>";
@@ -948,18 +1198,45 @@ static void handleRoot() {
   html += "<div class='section'>";
   html += "<h2>🚀 Quick Actions</h2>";
   html += "<div class='actions-grid'>";
+  html += "<a href='/alarms' class='btn'><span class='emoji-icon'>⏰</span>Alarm Settings</a>";
   html += "<a href='/calibrate' class='btn'><span class='emoji-icon'>🎯</span>Calibrate</a>";
   html += "<a href='/reboot' class='btn'><span class='emoji-icon'>🔄</span>Reboot</a>";
   html += "<a href='/wifi' class='btn'><span class='emoji-icon'>📶</span>Reconnect WiFi</a>";
   html += "<a href='/test/music' class='btn'><span class='emoji-icon'>🎵</span>Test Music</a>";
   html += "<a href='/test/emotion' class='btn'><span class='emoji-icon'>😊</span>Test Emotions</a>";
   html += "<a href='/test/brightness' class='btn'><span class='emoji-icon'>💡</span>Test Brightness</a>";
+  html += "<a href='/test/alarm' class='btn'><span class='emoji-icon'>🔔</span>Test Alarm</a>";
   html += "<a href='/factory_reset' class='btn' style='background:linear-gradient(135deg,#ff416c 0%,#ff4b2b 100%);'><span class='emoji-icon'>⚠️</span>Factory Reset</a>";
   html += "</div>";
   html += "</div>";
   
+  // Active Alarms Display
+  html += "<div class='section'>";
+  html += "<h2>⏰ Active Alarms</h2>";
+  int activeCount = 0;
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (alarms[i].enabled) {
+      activeCount++;
+      html += "<div class='alarm-item'>";
+      html += "<strong>" + alarms[i].label + "</strong> - ";
+      html += String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour);
+      html += ":";
+      html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
+      html += " ";
+      String days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      for (int d = 0; d < 7; d++) {
+        if (alarms[i].days[d]) html += days[d].substring(0, 1) + " ";
+      }
+      html += "</div>";
+    }
+  }
+  if (activeCount == 0) {
+    html += "<p>No alarms set. <a href='/alarms'>Set alarms here</a></p>";
+  }
+  html += "</div>";
+  
   html += "<div style='text-align:center;margin-top:40px;color:#666;font-size:0.9em;'>";
-  html += "<p>Emo Face Pro v2.0 | ";
+  html += "<p>Emo Face Pro v2.1 | ";
   html += __DATE__;
   html += " | ";
   html += wifi_connected ? "Connected" : "AP Mode";
@@ -968,7 +1245,7 @@ static void handleRoot() {
   
   html += "</div>";
   
-  // JavaScript for form validation and better UX
+  // JavaScript
   html += "<script>";
   html += "function validateForm() {";
   html += "  var sleep = document.getElementById('sleep_hour').value;";
@@ -983,7 +1260,10 @@ static void handleRoot() {
   html += "  }";
   html += "  return true;";
   html += "}";
-  html += "// Live update sliders";
+  html += "function toggleWeatherFields(enabled) {";
+  html += "  document.getElementById('weatherFields').style.display = enabled ? 'block' : 'none';";
+  html += "  document.getElementById('weatherCityField').style.display = enabled ? 'block' : 'none';";
+  html += "}";
   html += "document.addEventListener('DOMContentLoaded', function() {";
   html += "  var sliders = document.querySelectorAll('input[type=range]');";
   html += "  sliders.forEach(function(slider) {";
@@ -1007,7 +1287,6 @@ static void handleRoot() {
 
 static void handleSave() {
   if (webServer.method() == HTTP_POST) {
-    // Parse all form parameters
     for (int i = 0; i < webServer.args(); i++) {
       String name = webServer.argName(i);
       String value = webServer.arg(i);
@@ -1032,41 +1311,50 @@ static void handleSave() {
         config.wake_hour = value.toInt();
       } else if (name == "brightness") {
         config.brightness = value.toInt();
-        // Update brightness immediately
         updateBrightness();
+      } else if (name == "color_speed") {
+        config.color_transition_speed = value.toFloat();
+      } else if (name == "lip_sync_sensitivity") {
+        config.lip_sync_sensitivity = value.toInt();
+      } else if (name == "alarm_volume") {
+        config.alarm_volume = value.toInt();
+      } else if (name == "weather_api_key") {
+        config.weather_api_key = value;
+      } else if (name == "weather_city") {
+        config.weather_city = value;
       } else if (name == "auto_emotion") {
         config.auto_emotion = true;
       } else if (name == "voice_reactions") {
         config.voice_reactions = true;
       } else if (name == "music_reactions") {
         config.music_reactions = true;
+      } else if (name == "lip_sync_enabled") {
+        config.lip_sync_enabled = true;
+      } else if (name == "notifications_enabled") {
+        config.notifications_enabled = true;
+      } else if (name == "weather_enabled") {
+        config.weather_enabled = true;
       }
     }
     
-    // Checkboxes that weren't submitted are false
     if (!webServer.hasArg("auto_emotion")) config.auto_emotion = false;
     if (!webServer.hasArg("voice_reactions")) config.voice_reactions = false;
     if (!webServer.hasArg("music_reactions")) config.music_reactions = false;
+    if (!webServer.hasArg("lip_sync_enabled")) config.lip_sync_enabled = false;
+    if (!webServer.hasArg("notifications_enabled")) config.notifications_enabled = false;
+    if (!webServer.hasArg("weather_enabled")) config.weather_enabled = false;
     
     saveConfig();
     
-    // Show success message
     String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'></head><body style='font-family:Arial;text-align:center;padding:50px;'>";
     html += "<div style='max-width:500px;margin:auto;background:#f0f0f0;padding:30px;border-radius:10px;'>";
     html += "<h1 style='color:#4CAF50;'>✅ Settings Saved!</h1>";
     html += "<p>Configuration has been updated successfully.</p>";
-    html += "<p>Brightness: ";
-    html += String(config.brightness);
-    html += "%</p>";
-    html += "<p>Music Sensitivity: ";
-    html += String(config.music_sensitivity);
-    html += "</p>";
     html += "<a href='/' style='display:inline-block;margin-top:20px;padding:10px 20px;background:#4CAF50;color:white;text-decoration:none;border-radius:5px;'>Return to Dashboard</a>";
     html += "</div></body></html>";
     
     webServer.send(200, "text/html", html);
     
-    // Reconnect WiFi if settings changed
     if (webServer.hasArg("wifi_ssid")) {
       #if ENABLE_WIFI
       wifi_connected = false;
@@ -1079,7 +1367,6 @@ static void handleSave() {
   }
 }
 
-// Web server handlers
 static void handleCalibrate() {
   calibration_mode = true;
   String html = "<html><body><h1>Calibration Mode Activated</h1>";
@@ -1119,7 +1406,6 @@ static void handleReconnectWiFi() {
   webServer.send(200, "text/html", html);
 }
 
-// New handler for brightness test
 static void handleTestBrightness() {
   static int test_brightness = 50;
   test_brightness = (test_brightness == 50) ? 100 : 50;
@@ -1155,7 +1441,6 @@ static void handleTestBrightnessRestore() {
   webServer.send(303);
 }
 
-// New handler for emotion test
 static void handleTestEmotion() {
   static int emotion_index = 0;
   Emotion emotions[] = {EMO_NORMAL, EMO_HAPPY, EMO_SAD, EMO_EXCITED, EMO_ANGRY, EMO_CURIOUS, EMO_SLEEPY};
@@ -1174,12 +1459,19 @@ static void handleTestEmotion() {
   webServer.send(200, "text/html", html);
 }
 
-// New handler for factory reset
+static void handleTestAlarm() {
+  triggerAlarm(0);
+  String html = "<html><body><h1>Alarm Test</h1>";
+  html += "<p>Test alarm triggered!</p>";
+  html += "<p><a href='/'>Back to config</a></p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
 static void handleFactoryReset() {
   String html = "<html><body style='text-align:center;padding:50px;'>";
   
   if (webServer.hasArg("confirm")) {
-    // Perform factory reset
     preferences.begin("config", false);
     preferences.clear();
     preferences.end();
@@ -1189,6 +1481,10 @@ static void handleFactoryReset() {
     preferences.end();
     
     preferences.begin("mood", false);
+    preferences.clear();
+    preferences.end();
+    
+    preferences.begin("alarms", false);
     preferences.clear();
     preferences.end();
     
@@ -1209,6 +1505,7 @@ static void handleFactoryReset() {
     html += "<li>WiFi credentials</li>";
     html += "<li>Display settings</li>";
     html += "<li>Music reaction settings</li>";
+    html += "<li>Alarm settings</li>";
     html += "<li>Calibration data</li>";
     html += "<li>Mood history</li>";
     html += "</ul>";
@@ -1224,12 +1521,244 @@ static void handleFactoryReset() {
   }
 }
 
+static void handleAlarms() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta charset='UTF-8'>";
+  html += "<title>Alarm Settings - Emo Face Pro</title>";
+  html += "<style>";
+  html += "* { box-sizing: border-box; }";
+  html += "body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;}";
+  html += ".container{max-width:800px;margin:auto;background:rgba(255,255,255,0.95);padding:30px;border-radius:20px;box-shadow:0 10px 30px rgba(0,0,0,0.3);}";
+  html += "h1{color:#333;text-align:center;margin-bottom:30px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}";
+  html += ".alarm-card{background:linear-gradient(135deg,#f5f7fa 0%,#c3cfe2 100%);border-radius:15px;padding:20px;margin:15px 0;box-shadow:0 5px 15px rgba(0,0,0,0.1);}";
+  html += ".alarm-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;}";
+  html += ".alarm-time{font-size:2em;font-weight:bold;color:#333;}";
+  html += ".alarm-label{font-size:1.2em;color:#555;margin:10px 0;}";
+  html += ".day-selector{display:flex;gap:5px;margin:10px 0;}";
+  html += ".day-btn{padding:5px 10px;border-radius:5px;border:1px solid #ddd;cursor:pointer;background:#fff;}";
+  html += ".day-btn.active{background:#667eea;color:white;}";
+  html += ".btn{padding:10px 20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:8px;cursor:pointer;margin:5px;text-decoration:none;display:inline-block;}";
+  html += ".btn-danger{background:linear-gradient(135deg,#ff416c 0%,#ff4b2b 100%);}";
+  html += ".btn-success{background:linear-gradient(135deg,#4CAF50 0%,#2E7D32 100%);}";
+  html += ".form-group{margin:15px 0;}";
+  html += "input[type=time],input[type=text],select{padding:10px;border:2px solid #ddd;border-radius:5px;width:100%;}";
+  html += ".alarm-type{display:flex;gap:10px;margin:10px 0;}";
+  html += ".type-option{padding:10px;border:2px solid #ddd;border-radius:5px;cursor:pointer;background:#fff;}";
+  html += ".type-option.active{border-color:#667eea;background:#e8f0fe;}";
+  html += ".switch{position:relative;display:inline-block;width:60px;height:34px;}";
+  html += ".switch input{opacity:0;width:0;height:0;}";
+  html += ".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:34px;}";
+  html += ".slider:before{position:absolute;content:\"\";height:26px;width:26px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%;}";
+  html += "input:checked + .slider{background-color:#667eea;}";
+  html += "input:checked + .slider:before{transform:translateX(26px);}";
+  html += "</style>";
+  html += "<script>";
+  html += "function toggleDay(btn, alarmIndex, dayIndex) {";
+  html += "  btn.classList.toggle('active');";
+  html += "  var daysInput = document.getElementById('days_' + alarmIndex);";
+  html += "  if(!daysInput) return;";
+  html += "  var days = daysInput.value.split(',').map(Number);";
+  html += "  days[dayIndex] = days[dayIndex] ? 0 : 1;";
+  html += "  daysInput.value = days.join(',');";
+  html += "}";
+  html += "function setAlarmType(type, alarmIndex) {";
+  html += "  document.querySelectorAll('#type_' + alarmIndex + ' .type-option').forEach(el => el.classList.remove('active'));";
+  html += "  event.target.classList.add('active');";
+  html += "  document.getElementById('type_input_' + alarmIndex).value = type;";
+  html += "}";
+  html += "function testAlarm() {";
+  html += "  fetch('/test/alarm');";
+  html += "  alert('Test alarm triggered! Check your device.');";
+  html += "}";
+  html += "function toggleAlarm(index, enabled) {";
+  html += "  document.getElementById('enabled_' + index).value = enabled ? '1' : '0';";
+  html += "}";
+  html += "function saveAlarm(index) {";
+  html += "  var form = document.getElementById('alarm_form_' + index);";
+  html += "  form.submit();";
+  html += "}";
+  html += "function deleteAlarm(index) {";
+  html += "  if(confirm('Delete this alarm?')) {";
+  html += "    window.location.href = '/delete_alarm?index=' + index;";
+  html += "  }";
+  html += "}";
+  html += "function addAlarm() {";
+  html += "  var time = document.getElementById('newAlarmTime').value;";
+  html += "  var label = document.getElementById('newAlarmLabel').value || 'New Alarm';";
+  html += "  if(!time) { alert('Please set a time'); return; }";
+  html += "  window.location.href = '/save_alarm?time=' + time + '&label=' + encodeURIComponent(label);";
+  html += "}";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>⏰ Alarm Settings</h1>";
+  
+  html += "<div style='text-align:center;margin-bottom:30px;'>";
+  html += "<a href='/' class='btn'>← Back to Main</a>";
+  html += "<button class='btn' onclick='testAlarm()'>🔔 Test Alarm</button>";
+  html += "</div>";
+  
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    html += "<div class='alarm-card'>";
+    html += "<div class='alarm-header'>";
+    html += "<div class='alarm-time'>";
+    html += String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour);
+    html += ":";
+    html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
+    html += "</div>";
+    html += "<label class='switch'>";
+    html += "<input type='checkbox' " + String(alarms[i].enabled ? "checked" : "") + " onchange='toggleAlarm(" + String(i) + ", this.checked)'>";
+    html += "<span class='slider'></span>";
+    html += "</label>";
+    html += "</div>";
+    
+    html += "<form id='alarm_form_" + String(i) + "' method='post' action='/save_alarm'>";
+    html += "<input type='hidden' name='index' value='" + String(i) + "'>";
+    html += "<input type='hidden' id='enabled_" + String(i) + "' name='enabled' value='" + String(alarms[i].enabled ? "1" : "0") + "'>";
+    
+    html += "<div class='form-group'>";
+    html += "<label>Time:</label>";
+    html += "<input type='time' name='time' value='";
+    html += String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour);
+    html += ":";
+    html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
+    html += "' required>";
+    html += "</div>";
+    
+    html += "<div class='form-group'>";
+    html += "<label>Label:</label>";
+    html += "<input type='text' name='label' value='" + alarms[i].label + "' placeholder='Wake Up Alarm'>";
+    html += "</div>";
+    
+    html += "<div class='form-group'>";
+    html += "<label>Repeat:</label>";
+    html += "<div class='day-selector'>";
+    String days[] = {"S", "M", "T", "W", "T", "F", "S"};
+    String daysValue = "";
+    for (int d = 0; d < 7; d++) {
+      html += "<div class='day-btn " + String(alarms[i].days[d] ? "active" : "") + "' onclick='toggleDay(this, " + String(i) + ", " + String(d) + ")'>" + days[d] + "</div>";
+      daysValue += String(alarms[i].days[d] ? "1" : "0");
+      if (d < 6) daysValue += ",";
+    }
+    html += "<input type='hidden' id='days_" + String(i) + "' name='days' value='" + daysValue + "'>";
+    html += "</div>";
+    html += "</div>";
+    
+    html += "<div class='form-group'>";
+    html += "<label>Alarm Type:</label>";
+    html += "<div class='alarm-type' id='type_" + String(i) + "'>";
+    html += "<div class='type-option " + String(alarms[i].type == 0 ? "active" : "") + "' onclick='setAlarmType(0, " + String(i) + ")'>Gentle</div>";
+    html += "<div class='type-option " + String(alarms[i].type == 1 ? "active" : "") + "' onclick='setAlarmType(1, " + String(i) + ")'>Standard</div>";
+    html += "<div class='type-option " + String(alarms[i].type == 2 ? "active" : "") + "' onclick='setAlarmType(2, " + String(i) + ")'>Energetic</div>";
+    html += "</div>";
+    html += "<input type='hidden' id='type_input_" + String(i) + "' name='type' value='" + String(alarms[i].type) + "'>";
+    html += "</div>";
+    
+    html += "<div style='text-align:center;'>";
+    html += "<button type='button' class='btn btn-success' onclick='saveAlarm(" + String(i) + ")'>💾 Save Alarm</button>";
+    html += "<button type='button' class='btn btn-danger' onclick='deleteAlarm(" + String(i) + ")'>🗑️ Delete</button>";
+    html += "</div>";
+    
+    html += "</form>";
+    html += "</div>";
+  }
+  
+  html += "<div class='alarm-card'>";
+  html += "<h3 style='text-align:center;'>Add New Alarm</h3>";
+  html += "<div class='form-group'>";
+  html += "<label>Time:</label>";
+  html += "<input type='time' id='newAlarmTime' required>";
+  html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Label:</label>";
+  html += "<input type='text' id='newAlarmLabel' placeholder='Wake Up Alarm'>";
+  html += "</div>";
+  html += "<div style='text-align:center;'>";
+  html += "<button type='button' class='btn' onclick='addAlarm()'>➕ Add Alarm</button>";
+  html += "</div>";
+  html += "</div>";
+  
+  html += "</div>";
+  html += "</body></html>";
+  
+  webServer.send(200, "text/html", html);
+}
+
+static void handleSaveAlarm() {
+  if (webServer.method() == HTTP_POST) {
+    int index = webServer.arg("index").toInt();
+    if (index >= 0 && index < MAX_ALARMS) {
+      String timeStr = webServer.arg("time");
+      int colonPos = timeStr.indexOf(':');
+      if (colonPos > 0) {
+        alarms[index].hour = timeStr.substring(0, colonPos).toInt();
+        alarms[index].minute = timeStr.substring(colonPos + 1).toInt();
+      }
+      
+      alarms[index].label = webServer.arg("label");
+      alarms[index].enabled = webServer.arg("enabled") == "1";
+      alarms[index].type = webServer.arg("type").toInt();
+      
+      String daysStr = webServer.arg("days");
+      int dayIndex = 0;
+      int startPos = 0;
+      while (dayIndex < 7 && startPos < daysStr.length()) {
+        int endPos = daysStr.indexOf(',', startPos);
+        if (endPos == -1) endPos = daysStr.length();
+        alarms[index].days[dayIndex] = daysStr.substring(startPos, endPos).toInt();
+        startPos = endPos + 1;
+        dayIndex++;
+      }
+      
+      saveAlarms();
+    }
+    
+    webServer.sendHeader("Location", "/alarms");
+    webServer.send(303);
+  } else {
+    String timeStr = webServer.arg("time");
+    String label = webServer.arg("label");
+    
+    // Find empty slot
+    for (int i = 0; i < MAX_ALARMS; i++) {
+      if (!alarms[i].enabled && alarms[i].label == "Alarm " + String(i + 1)) {
+        int colonPos = timeStr.indexOf(':');
+        if (colonPos > 0) {
+          alarms[i].hour = timeStr.substring(0, colonPos).toInt();
+          alarms[i].minute = timeStr.substring(colonPos + 1).toInt();
+        }
+        alarms[i].label = label;
+        alarms[i].enabled = true;
+        for (int d = 0; d < 7; d++) alarms[i].days[d] = (d < 5); // Weekdays default
+        
+        saveAlarms();
+        break;
+      }
+    }
+    
+    webServer.sendHeader("Location", "/alarms");
+    webServer.send(303);
+  }
+}
+
+static void handleDeleteAlarm() {
+  int index = webServer.arg("index").toInt();
+  if (index >= 0 && index < MAX_ALARMS) {
+    alarms[index].enabled = false;
+    alarms[index].label = "Alarm " + String(index + 1);
+    saveAlarms();
+  }
+  
+  webServer.sendHeader("Location", "/alarms");
+  webServer.send(303);
+}
+
 static void startAPMode() {
   WiFi.mode(WIFI_AP);
   
-  // Generate unique AP name with MAC address using WiFi.macAddress()
   uint8_t mac[6];
-  WiFi.macAddress(mac);  // Use Arduino WiFi method
+  WiFi.macAddress(mac);
   
   char apName[32];
   sprintf(apName, "EmoFacePro-%02X%02X", mac[4], mac[5]);
@@ -1246,17 +1775,15 @@ static void startAPMode() {
     return;
   }
   
-  delay(100); // Give AP time to start
+  delay(100);
   
   IPAddress apIP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
   Serial.println(apIP);
   
-  // Start DNS server
   dnsServer.start(DNS_PORT, "*", apIP);
   Serial.println("DNS server started");
   
-  // Initialize web server
   initWebServer();
   
   web_server_active = true;
@@ -1273,13 +1800,12 @@ static void startAPMode() {
   Serial.println("Open browser to: http://192.168.4.1");
   Serial.println("=============================");
   
-  // Play tone to indicate AP mode
   if (i2s_spk_init_success) {
-    playTone(523, 200, 0.3f);  // C note
+    playTone(523, 200, 0.3f);
     delay(100);
-    playTone(659, 200, 0.3f);  // E note
+    playTone(659, 200, 0.3f);
     delay(100);
-    playTone(784, 300, 0.3f);  // G note
+    playTone(784, 300, 0.3f);
   }
 }
 
@@ -1292,10 +1818,13 @@ static void initWebServer() {
   webServer.on("/test/emotion", handleTestEmotion);
   webServer.on("/test/brightness", handleTestBrightness);
   webServer.on("/test/brightness/restore", handleTestBrightnessRestore);
+  webServer.on("/test/alarm", handleTestAlarm);
   webServer.on("/wifi", handleReconnectWiFi);
   webServer.on("/factory_reset", handleFactoryReset);
+  webServer.on("/alarms", handleAlarms);
+  webServer.on("/save_alarm", handleSaveAlarm);
+  webServer.on("/delete_alarm", handleDeleteAlarm);
   
-  // Add a 404 handler
   webServer.onNotFound([]() {
     String message = "File Not Found\n\n";
     message += "URI: " + webServer.uri() + "\n";
@@ -1530,13 +2059,12 @@ static float mic_read_loudness() {
   for (int i = 0; i < samples; i++) {
     float s = (float)(mic_buffer[i] >> SAMPLE_SHIFT);
     s = dc_block(s);
-    s *= config.mic_gain;  // Use configurable gain
+    s *= config.mic_gain;
     
     float a = fabsf(s);
     if (a > peak) peak = a;
   }
   
-  // Scale based on sensitivity setting
   float scaled_peak = peak / (500000.0f / (config.music_sensitivity * 0.5f));
   return fminf(1.0f, scaled_peak);
 }
@@ -1573,134 +2101,495 @@ static void emotionBlip(Emotion e) {
   playTone(f, 80, 0.35f);
 }
 
-static lv_obj_t *mouth = nullptr;
-
-static void updateMouthForEmotion(Emotion e) {
-  if (!mouth) return;
-  
-  lv_anim_t anim;
-  lv_anim_init(&anim);
-  lv_anim_set_var(&anim, mouth);
-  
-  switch(e) {
-    case EMO_HAPPY:
-      lv_anim_set_values(&anim, 28, 36);
-      lv_anim_set_time(&anim, 800);
-      break;
-    case EMO_SAD:
-      lv_anim_set_values(&anim, 20, 24);
-      lv_anim_set_time(&anim, 2000);
-      break;
-    case EMO_EXCITED:
-      lv_anim_set_values(&anim, 30, 38);
-      lv_anim_set_time(&anim, 600);
-      break;
-    case EMO_SLEEPY:
-      lv_anim_set_values(&anim, 18, 22);
-      lv_anim_set_time(&anim, 3000);
-      break;
-    case EMO_ANGRY:
-      lv_anim_set_values(&anim, 22, 26);
-      lv_anim_set_time(&anim, 500);
-      break;
-    default:
-      lv_anim_set_values(&anim, 20, 32);
-      lv_anim_set_time(&anim, 1500);
-      break;
+// ================== ALARM SYSTEM ==================
+static void initAlarmSystem() {
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    alarms[i].enabled = false;
+    alarms[i].hour = 7;
+    alarms[i].minute = 0;
+    for (int d = 0; d < 7; d++) {
+      alarms[i].days[d] = (d < 5);
+    }
+    alarms[i].label = "Alarm " + String(i + 1);
+    alarms[i].type = 1;
+    alarms[i].snoozed = false;
+    alarms[i].snooze_minutes = 5;
   }
   
-  lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
-  lv_anim_set_exec_cb(&anim, [](void *obj, int32_t v){
-    lv_obj_set_width((lv_obj_t*)obj, v);
-    lv_obj_set_x((lv_obj_t*)obj, (SCR_W - v)/2);
-  });
+  loadAlarms();
   
-  lv_anim_start(&anim);
+  alarm_label = lv_label_create(lv_scr_act());
+  lv_obj_add_style(alarm_label, &style_time_text, 0);
+  lv_obj_set_width(alarm_label, SCR_W);
+  lv_obj_set_pos(alarm_label, 0, 50);
+  lv_label_set_text(alarm_label, "");
+  lv_obj_set_style_text_align(alarm_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(alarm_label, lv_color_hex(0xFFCC00), 0);
 }
 
-#if ENABLE_TTS
-static void speakText(const char* text) {
-  if (power_save_mode || scheduled_sleep || !i2s_spk_init_success || !config.voice_reactions) return;
+static void saveAlarms() {
+  preferences.begin("alarms", false);
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    String prefix = "alarm" + String(i);
+    preferences.putBool((prefix + "_enabled").c_str(), alarms[i].enabled);
+    preferences.putInt((prefix + "_hour").c_str(), alarms[i].hour);
+    preferences.putInt((prefix + "_minute").c_str(), alarms[i].minute);
+    preferences.putString((prefix + "_label").c_str(), alarms[i].label);
+    preferences.putInt((prefix + "_type").c_str(), alarms[i].type);
+    
+    uint8_t days_bitmap = 0;
+    for (int d = 0; d < 7; d++) {
+      if (alarms[i].days[d]) days_bitmap |= (1 << d);
+    }
+    preferences.putUChar((prefix + "_days").c_str(), days_bitmap);
+  }
+  preferences.end();
+}
+
+static void loadAlarms() {
+  preferences.begin("alarms", true);
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    String prefix = "alarm" + String(i);
+    alarms[i].enabled = preferences.getBool((prefix + "_enabled").c_str(), false);
+    alarms[i].hour = preferences.getInt((prefix + "_hour").c_str(), 7);
+    alarms[i].minute = preferences.getInt((prefix + "_minute").c_str(), 0);
+    alarms[i].label = preferences.getString((prefix + "_label").c_str(), "Alarm " + String(i + 1));
+    alarms[i].type = preferences.getInt((prefix + "_type").c_str(), 1);
+    
+    uint8_t days_bitmap = preferences.getUChar((prefix + "_days").c_str(), 0x1F);
+    for (int d = 0; d < 7; d++) {
+      alarms[i].days[d] = (days_bitmap & (1 << d)) != 0;
+    }
+  }
+  preferences.end();
+}
+
+static void checkAlarms() {
+  if (!time_synced || alarm_triggered) return;
   
-  int current_hour = -1;
-  #if ENABLE_TIME_FEATURES
-  current_hour = getCurrentHour();
-  #endif
+  uint32_t now = millis();
+  if (now - last_alarm_check < 60000) return;
   
-  if (current_hour >= SLEEP_HOUR || current_hour < WAKE_HOUR) {
+  last_alarm_check = now;
+  
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+  
+  int current_hour = timeinfo.tm_hour;
+  int current_minute = timeinfo.tm_min;
+  int current_day = timeinfo.tm_wday;
+  
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (!alarms[i].enabled || alarms[i].snoozed) continue;
+    
+    if (!alarms[i].days[current_day]) continue;
+    
+    if (alarms[i].hour == current_hour && alarms[i].minute == current_minute) {
+      triggerAlarm(i);
+      return;
+    }
+  }
+}
+
+static void triggerAlarm(int alarm_index) {
+  alarm_triggered = true;
+  current_alarm_index = alarm_index;
+  alarm_start_time = millis();
+  
+  Alarm &alarm = alarms[alarm_index];
+  
+  Serial.println("ALARM TRIGGERED: " + alarm.label);
+  
+  if (alarm_label) {
+    lv_label_set_text(alarm_label, ("⏰ " + alarm.label).c_str());
+    lv_obj_set_style_text_color(alarm_label, lv_color_hex(0xFF3366), 0);
+  }
+  
+  enhancedSetEmotion(EMO_EXCITED, false);
+  
+  switch(alarm.type) {
+    case 0:
+      for(int i = 0; i < 5; i++) {
+        playTone(440 + i*55, 200, config.alarm_volume * 0.05f);
+        delay(300);
+      }
+      break;
+      
+    case 1:
+      for(int i = 0; i < 10; i++) {
+        playTone(880, 100, config.alarm_volume * 0.08f);
+        delay(200);
+        if (i % 2 == 0) blink_eyes(60);
+      }
+      break;
+      
+    case 2:
+      for(int i = 0; i < 20; i++) {
+        playTone(523 + (i%3)*110, 80, config.alarm_volume * 0.1f);
+        delay(100);
+        if (i % 3 == 0) {
+          lv_obj_set_style_bg_color(eyeL.eye, lv_color_hex(0xFF6600), 0);
+          lv_obj_set_style_bg_color(eyeR.eye, lv_color_hex(0xFF6600), 0);
+        } else {
+          lv_obj_set_style_bg_color(eyeL.eye, COL_EYE[EMO_EXCITED], 0);
+          lv_obj_set_style_bg_color(eyeR.eye, COL_EYE[EMO_EXCITED], 0);
+        }
+      }
+      break;
+  }
+}
+
+static void stopAlarm() {
+  if (!alarm_triggered) return;
+  
+  alarm_triggered = false;
+  
+  if (alarm_label) {
+    lv_label_set_text(alarm_label, "");
+  }
+  
+  enhancedSetEmotion(current_emotion, false);
+  
+  Serial.println("Alarm stopped");
+}
+
+static void snoozeAlarm() {
+  if (!alarm_triggered || current_alarm_index == -1) return;
+  
+  alarms[current_alarm_index].snoozed = true;
+  
+  lv_timer_t *snooze_timer = lv_timer_create([](lv_timer_t *t) {
+    int alarm_idx = (int)(intptr_t)t->user_data;
+    if (alarm_idx >= 0 && alarm_idx < MAX_ALARMS) {
+      alarms[alarm_idx].snoozed = false;
+    }
+    lv_timer_del(t);
+  }, alarms[current_alarm_index].snooze_minutes * 60000, (void*)(intptr_t)current_alarm_index);
+  
+  stopAlarm();
+}
+
+static String getNextAlarmTime() {
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (alarms[i].enabled && !alarms[i].snoozed) {
+      return String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour) + ":" + 
+             (String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute));
+    }
+  }
+  return "No alarms";
+}
+
+static int countActiveAlarms() {
+  int count = 0;
+  for (int i = 0; i < MAX_ALARMS; i++) {
+    if (alarms[i].enabled) count++;
+  }
+  return count;
+}
+
+// ================== LIP ANIMATION ==================
+static void initLipAnimation() {
+  mouth_top = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(mouth_top, 32, 6);
+  lv_obj_set_style_radius(mouth_top, 12, 0);
+  lv_obj_set_style_bg_color(mouth_top, lv_color_hex(0xD43F3F), 0);
+  lv_obj_set_style_bg_opa(mouth_top, LV_OPA_COVER, 0);
+  lv_obj_set_pos(mouth_top, (SCR_W-32)/2, 200);
+  
+  mouth_bottom = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(mouth_bottom, 32, 6);
+  lv_obj_set_style_radius(mouth_bottom, 12, 0);
+  lv_obj_set_style_bg_color(mouth_bottom, lv_color_hex(0xD43F3F), 0);
+  lv_obj_set_style_bg_opa(mouth_bottom, LV_OPA_COVER, 0);
+  lv_obj_set_pos(mouth_bottom, (SCR_W-32)/2, 206);
+  
+  lv_obj_move_foreground(mouth_top);
+  lv_obj_move_foreground(mouth_bottom);
+}
+
+static void updateLipAnimation(float loudness, bool beat_detected) {
+  if (!config.lip_sync_enabled || scheduled_sleep) return;
+  
+  uint32_t now = millis();
+  if (now - last_lip_update < 30) return;
+  
+  last_lip_update = now;
+  
+  if (loudness > 0.1f && config.music_reactions) {
+    lipSyncToMusic(loudness, beat_bpm);
     return;
   }
   
-  tts_speaking = true;
-  current_tts_text = text;
-  tts_text_pos = 0;
-  tts_next_char_time = millis();
+  float breath = sin(millis() * 0.002f) * 0.3f + 0.7f;
+  int height = 6 * breath;
+  int separation = 2 + (int)(sin(millis() * 0.001f) * 1.5f);
   
-  playTone(784, 50, 0.3f);
-  delay(30);
+  lv_obj_set_height(mouth_top, height);
+  lv_obj_set_height(mouth_bottom, height);
+  
+  int mouth_width = 28 + (int)(sin(millis() * 0.0005f) * 4);
+  lv_obj_set_width(mouth_top, mouth_width);
+  lv_obj_set_width(mouth_bottom, mouth_width);
+  
+  lv_obj_set_x(mouth_top, (SCR_W - mouth_width)/2);
+  lv_obj_set_x(mouth_bottom, (SCR_W - mouth_width)/2);
+  lv_obj_set_y(mouth_bottom, 200 + height + separation);
 }
-#endif
 
-static void speakEmotion(Emotion e) {
-  if (power_save_mode || scheduled_sleep || !i2s_spk_init_success || !config.voice_reactions) return;
+static void lipSyncToMusic(float loudness, float bpm) {
+  float time = millis() * 0.001f;
   
-  int current_hour = -1;
-  #if ENABLE_TIME_FEATURES
-  current_hour = getCurrentHour();
-  #endif
+  float movement1 = sin(time * bpm * 0.01f) * 0.5f + 0.5f;
+  float movement2 = sin(time * bpm * 0.02f + 1.0f) * 0.3f;
+  float movement3 = cos(time * bpm * 0.005f + 2.0f) * 0.2f;
   
-  if (current_hour >= SLEEP_HOUR || current_hour < WAKE_HOUR) return;
+  float openness = (movement1 + movement2 + movement3) * loudness * 2.0f;
+  openness = constrain(openness, 0.0f, 1.0f);
   
-  const char* phrase = VOICE_PHRASES[e];
+  int max_height = 12;
+  int min_height = 2;
+  int height = min_height + (int)(openness * (max_height - min_height));
   
-  #if ENABLE_TTS
-  speakText(phrase);
-  #else
-  emotionBlip(e);
+  int min_width = 24;
+  int max_width = 40;
+  int width = min_width + (int)(openness * (max_width - min_width));
+  
+  int separation = 1 + (int)((1.0f - openness) * 3);
+  
+  lv_anim_t anim_top, anim_bottom;
+  lv_anim_init(&anim_top);
+  lv_anim_init(&anim_bottom);
+  
+  lv_anim_set_var(&anim_top, mouth_top);
+  lv_anim_set_var(&anim_bottom, mouth_bottom);
+  lv_anim_set_time(&anim_top, 80);
+  lv_anim_set_time(&anim_bottom, 80);
+  
+  lv_anim_set_values(&anim_top, lv_obj_get_height(mouth_top), height);
+  lv_anim_set_values(&anim_bottom, lv_obj_get_height(mouth_bottom), height);
+  
+  lv_anim_set_exec_cb(&anim_top, [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  });
+  lv_anim_set_exec_cb(&anim_bottom, [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  });
+  
+  lv_anim_start(&anim_top);
+  lv_anim_start(&anim_bottom);
+  
+  lv_obj_set_width(mouth_top, width);
+  lv_obj_set_width(mouth_bottom, width);
+  lv_obj_set_x(mouth_top, (SCR_W - width)/2);
+  lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
+  lv_obj_set_y(mouth_bottom, 200 + height + separation);
+  
+  uint8_t color_intensity = 160 + (int)(openness * 95);
+  lv_color_t lip_color = lv_color_make(color_intensity, 40, 40);
+  lv_obj_set_style_bg_color(mouth_top, lip_color, 0);
+  lv_obj_set_style_bg_color(mouth_bottom, lip_color, 0);
+}
+
+static void setLipShapeForEmotion(Emotion e) {
+  if (!config.lip_sync_enabled) return;
+  
+  int top_height, bottom_height, width, separation;
+  lv_color_t color = lv_color_hex(0xD43F3F);
   
   switch(e) {
     case EMO_HAPPY:
-      playTone(784, 100, 0.3f);
-      delay(50);
-      playTone(988, 150, 0.3f);
+      top_height = 4; bottom_height = 6; width = 36; separation = 0;
+      color = lv_color_hex(0xFF3366);
       break;
     case EMO_SAD:
-      playTone(523, 200, 0.25f);
-      delay(100);
-      playTone(440, 300, 0.25f);
+      top_height = 3; bottom_height = 3; width = 30; separation = 4;
+      color = lv_color_hex(0x9933CC);
       break;
     case EMO_EXCITED:
-      playTone(659, 80, 0.35f);
-      delay(40);
-      playTone(784, 80, 0.35f);
-      delay(40);
-      playTone(988, 200, 0.35f);
+      top_height = 6; bottom_height = 8; width = 40; separation = 1;
+      color = lv_color_hex(0xFF6600);
       break;
     case EMO_ANGRY:
-      playTone(622, 150, 0.4f);
-      delay(100);
-      playTone(466, 150, 0.4f);
-      break;
-    case EMO_CURIOUS:
-      playTone(740, 100, 0.3f);
-      delay(150);
-      playTone(740, 100, 0.3f);
+      top_height = 3; bottom_height = 3; width = 28; separation = 2;
+      color = lv_color_hex(0xFF0000);
       break;
     case EMO_SLEEPY:
-      playTone(440, 300, 0.2f);
-      delay(200);
-      playTone(330, 400, 0.2f);
+      top_height = 2; bottom_height = 2; width = 24; separation = 0;
+      color = lv_color_hex(0x9966FF);
+      break;
+    case EMO_CURIOUS:
+      top_height = 3; bottom_height = 4; width = 26; separation = 3;
+      color = lv_color_hex(0x33CCCC);
       break;
     default:
-      playTone(659, 100, 0.3f);
+      top_height = 4; bottom_height = 4; width = 32; separation = 2;
       break;
   }
-  #endif
+  
+  lv_anim_t anim;
+  lv_anim_init(&anim);
+  lv_anim_set_time(&anim, 300);
+  lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
+  
+  lv_anim_set_var(&anim, mouth_top);
+  lv_anim_set_values(&anim, lv_obj_get_height(mouth_top), top_height);
+  lv_anim_set_exec_cb(&anim, [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  });
+  lv_anim_start(&anim);
+  
+  lv_anim_set_var(&anim, mouth_bottom);
+  lv_anim_set_values(&anim, lv_obj_get_height(mouth_bottom), bottom_height);
+  anim.exec_cb = [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  };
+  lv_anim_start(&anim);
+  
+  lv_obj_set_width(mouth_top, width);
+  lv_obj_set_width(mouth_bottom, width);
+  lv_obj_set_x(mouth_top, (SCR_W - width)/2);
+  lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
+  lv_obj_set_y(mouth_bottom, 200 + top_height + separation);
+  
+  lv_obj_set_style_bg_color(mouth_top, color, 0);
+  lv_obj_set_style_bg_color(mouth_bottom, color, 0);
 }
 
-// ================== ENHANCED MUSIC REACTIONS ==================
+#if ENABLE_WIFI
+static void initWeatherDisplay() {
+  if (!config.weather_enabled) return;
+  
+  weather_label = lv_label_create(lv_scr_act());
+  lv_obj_add_style(weather_label, &style_time_text, 0);
+  lv_obj_set_width(weather_label, SCR_W);
+  lv_obj_set_pos(weather_label, 0, 70);
+  lv_label_set_text(weather_label, "Weather: --°C");
+  lv_obj_set_style_text_align(weather_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(weather_label, lv_color_hex(0x33FF99), 0);
+}
 
-// Dancing eyebrows synchronized with music
+static void updateWeather() {
+  if (!config.weather_enabled || !wifi_connected) return;
+  
+  uint32_t now = millis();
+  if (now - last_weather_update < WEATHER_UPDATE_INTERVAL) return;
+  
+  last_weather_update = now;
+  fetchWeatherData();
+}
+
+static void fetchWeatherData() {
+  if (config.weather_api_key == "") return;
+  
+  WiFiClient client;
+  HTTPClient http;
+  
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + 
+               config.weather_city + 
+               "&appid=" + config.weather_api_key + 
+               "&units=metric";
+  
+  http.begin(client, url);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    
+    int temp_start = payload.indexOf("\"temp\":") + 7;
+    int temp_end = payload.indexOf(",", temp_start);
+    if (temp_start > 6 && temp_end > temp_start) {
+      weather_temp = payload.substring(temp_start, temp_end);
+    }
+    
+    int desc_start = payload.indexOf("\"description\":\"") + 15;
+    int desc_end = payload.indexOf("\"", desc_start);
+    if (desc_start > 14 && desc_end > desc_start) {
+      weather_condition = payload.substring(desc_start, desc_end);
+    }
+    
+    if (weather_label) {
+      String display_text = "🌡 " + weather_temp + "°C";
+      if (weather_condition != "") {
+        display_text += " " + weather_condition;
+      }
+      lv_label_set_text(weather_label, display_text.c_str());
+    }
+    
+    if (weather_condition.indexOf("rain") >= 0) {
+      enhancedSetEmotion(EMO_SAD);
+    } else if (weather_condition.indexOf("clear") >= 0) {
+      enhancedSetEmotion(EMO_HAPPY);
+    } else if (weather_condition.indexOf("cloud") >= 0) {
+      enhancedSetEmotion(EMO_NORMAL);
+    }
+    
+  } else {
+    Serial.println("Weather fetch failed: " + String(httpCode));
+  }
+  
+  http.end();
+}
+#endif
+
+// ================== PARTICLE SYSTEM ==================
+static void initParticleSystem() {
+  for (int i = 0; i < 20; i++) {
+    particles[i] = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(particles[i], 2, 2);
+    lv_obj_set_style_radius(particles[i], LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(particles[i], LV_OPA_0, 0);
+    lv_obj_add_flag(particles[i], LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+static void updateParticles(Emotion e) {
+  if (!particles_active) return;
+  
+  uint32_t now = millis();
+  if (now - particle_last_update < 16) return;
+  
+  particle_last_update = now;
+  
+  for (int i = 0; i < 20; i++) {
+    lv_obj_t *p = particles[i];
+    if (lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)) continue;
+    
+    int x = lv_obj_get_x(p);
+    int y = lv_obj_get_y(p);
+    
+    y -= 2;
+    lv_obj_set_pos(p, x, y);
+    
+    lv_opa_t opa = lv_obj_get_style_bg_opa(p, 0);
+    if (opa > 10) {
+      lv_obj_set_style_bg_opa(p, opa - 10, 0);
+    } else {
+      lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    if (y < -10) {
+      lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+static void spawnParticles(int x, int y, int count, lv_color_t color) {
+  particles_active = true;
+  
+  for (int i = 0; i < min(count, 20); i++) {
+    lv_obj_t *p = particles[i];
+    
+    int px = x + random(-10, 10);
+    int py = y + random(-10, 10);
+    
+    lv_obj_set_pos(p, px, py);
+    lv_obj_set_style_bg_color(p, color, 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Music reaction functions
 static void updateEyebrowDance(float loudness, float beat_bpm) {
   static uint32_t last_eyebrow_update = 0;
   uint32_t now = millis();
@@ -1710,35 +2599,28 @@ static void updateEyebrowDance(float loudness, float beat_bpm) {
   last_eyebrow_update = now;
   
   if (loudness > 0.1f) { 
-    // Update dance phase based on BPM with configurable speed
     float phase_increment = (loudness * 0.15f) + (beat_bpm / 800.0f);
     music_dance_phase += phase_increment * (config.eyebrow_dance_speed * 0.5f);
     
-    // Keep phase within 0-2π
     if (music_dance_phase > 6.283f) music_dance_phase -= 6.283f;
     
-    // Calculate eyebrow movement with multiple frequencies for complex dance
     float dance1 = sin(music_dance_phase);
     float dance2 = sin(music_dance_phase * 1.7f + 1.0f);
     float dance3 = cos(music_dance_phase * 0.6f + 2.0f);
     
     float eyebrow_tilt = (dance1 * 0.5f + dance2 * 0.3f + dance3 * 0.2f) * 15.0f * loudness;
     
-    // Different dance patterns for each eyebrow
     float eyebrow_left = eyebrow_tilt * 0.8f + sin(music_dance_phase * 0.9f) * 5.0f * loudness;
     float eyebrow_right = -eyebrow_tilt * 0.8f + cos(music_dance_phase * 0.8f + 1.5f) * 5.0f * loudness;
     
-    // Apply to eyebrows
     set_brow_line(eyeL, (int)eyebrow_left);
     set_brow_line(eyeR, (int)eyebrow_right);
     
-    // Change eyebrow thickness based on music intensity
     int line_width = 3 + (int)(loudness * 4);
     lv_obj_set_style_line_width(eyeL.brow, line_width, 0);
     lv_obj_set_style_line_width(eyeR.brow, line_width, 0);
     
   } else {
-    // Reset to emotion-based eyebrows when no music
     static Emotion last_emotion = EMO_NORMAL;
     if (current_emotion != last_emotion) {
       switch(current_emotion) {
@@ -1755,7 +2637,6 @@ static void updateEyebrowDance(float loudness, float beat_bpm) {
   }
 }
 
-// Jumping eyeballs synchronized with beats
 static void updateEyeballJump(float loudness, bool beat_detected_flag) {
   static uint32_t last_jump_update = 0;
   uint32_t now = millis();
@@ -1765,7 +2646,6 @@ static void updateEyeballJump(float loudness, bool beat_detected_flag) {
   last_jump_update = now;
   
   if (loudness > 0.1f) { 
-    // Continuous gentle movement with music
     float gentle_x = sin(music_dance_phase * 1.5f) * 4.0f * loudness;
     float gentle_y = cos(music_dance_phase * 1.2f + 0.5f) * 3.0f * loudness;
     
@@ -1774,30 +2654,24 @@ static void updateEyeballJump(float loudness, bool beat_detected_flag) {
     eyeR.music_dx += gentle_x * 0.15f;
     eyeR.music_dy += gentle_y * 0.15f;
     
-    // Strong jump on beat detection
     if (beat_detected_flag && loudness > 0.3f) {
       float jump_strength = (config.eyeball_jump_strength * 0.5f) * loudness;
       
-      // Random direction for more dynamic movement
-      float angle = random(0, 628) / 100.0f; // 0-2π
+      float angle = random(0, 628) / 100.0f;
       float jump_x = cos(angle) * jump_strength;
       float jump_y = sin(angle) * jump_strength;
       
-      // Apply jump to both eyes
       eyeL.addBeatImpact(jump_x, jump_y);
       eyeR.addBeatImpact(jump_x, jump_y);
       
-      // Blink on strong beats
       if (loudness > 0.5f && !eyeL.is_blinking) {
         blink_eyes(40 + (int)(loudness * 60));
       }
       
-      // Change pupil size on beat (more dramatic)
       int pulse_size = 6 + (int)(loudness * 16);
       eyeL.setPupilSize(pulse_size, pulse_size);
       eyeR.setPupilSize(pulse_size, pulse_size);
       
-      // Color pulse on strong beats
       if (loudness > 0.6f) {
         lv_obj_set_style_shadow_width(eyeL.eye, 30, 0);
         lv_obj_set_style_shadow_width(eyeR.eye, 30, 0);
@@ -1806,7 +2680,6 @@ static void updateEyeballJump(float loudness, bool beat_detected_flag) {
       }
     }
     
-    // Decay shadow effects
     static uint32_t last_shadow_decay = 0;
     if (now - last_shadow_decay > 80) {
       last_shadow_decay = now;
@@ -1840,9 +2713,9 @@ static void updateBeatDetection() {
   
   bool beat_detected_flag = false;
   
-  if (loudness > avg * 1.3f && loudness > MUSIC_THRESHOLD) {  // Lower multiplier for more sensitivity
+  if (loudness > avg * 1.3f && loudness > MUSIC_THRESHOLD) {
     uint32_t now = millis();
-    if (now - last_beat_time > 150) {  // Shorter cooldown
+    if (now - last_beat_time > 150) {
       beat_detected_flag = true;
       beat_detected = true;
       
@@ -1850,11 +2723,10 @@ static void updateBeatDetection() {
         float interval = (now - last_beat_time) / 1000.0f;
         float instant_bpm = 60.0f / interval;
         
-        beat_bpm = beat_bpm * 0.6f + instant_bpm * 0.4f;  // Faster response
+        beat_bpm = beat_bpm * 0.6f + instant_bpm * 0.4f;
       }
       last_beat_time = now;
       
-      // Auto-switch to excited emotion on strong music
       if (config.auto_emotion && loudness > 0.4f && current_emotion != EMO_EXCITED && random(100) < 50) {
         set_emotion(EMO_EXCITED);
       }
@@ -1863,11 +2735,9 @@ static void updateBeatDetection() {
     beat_detected = false;
   }
   
-  // Update music reactions
   updateEyebrowDance(loudness, beat_bpm);
   updateEyeballJump(loudness, beat_detected_flag);
   
-  // Update music dance intensity
   music_dance_intensity = music_dance_intensity * 0.9f + loudness * 0.1f;
   last_music_update = millis();
 }
@@ -1918,24 +2788,20 @@ static void handleGesture(Gesture g) {
   switch(g) {
     case GESTURE_SHAKE:
       set_emotion(EMO_EXCITED);
-      speakEmotion(EMO_EXCITED);
       break;
       
     case GESTURE_NOD:
       set_emotion(EMO_HAPPY);
-      speakEmotion(EMO_HAPPY);
       break;
       
     case GESTURE_TILT_LEFT:
       next_emotion = (Emotion)((current_emotion + 1) % EMO_COUNT);
       set_emotion(next_emotion);
-      speakEmotion(next_emotion);
       break;
       
     case GESTURE_TILT_RIGHT:
       prev_emotion_local = (Emotion)((current_emotion - 1 + EMO_COUNT) % EMO_COUNT);
       set_emotion(prev_emotion_local);
-      speakEmotion(prev_emotion_local);
       break;
       
     default:
@@ -1949,15 +2815,12 @@ static void handleGesture(Gesture g) {
 static void enhancedBlink() {
   if (eyeL.is_blinking || eyeR.is_blinking) return;
   
-  // Music-influenced blinking
   if (current_loudness > 0.2f) {
-    // Faster blinking with music
     blink_speed = 60 + (int)(current_loudness * 60);
     if (random(100) < current_loudness * 40) {
       blink_eyes(blink_speed);
     }
   } else {
-    // Normal emotion-based blinking
     switch(current_emotion) {
       case EMO_SLEEPY:
         blink_speed = 300;
@@ -2008,10 +2871,10 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
   #endif
   
   if (withVoice && !scheduled_sleep && config.voice_reactions) {
-    speakEmotion(emo);
+    emotionBlip(emo);
   }
   
-  updateMouthForEmotion(emo);
+  setLipShapeForEmotion(emo);
   
   switch(emo) {
     case EMO_HAPPY:
@@ -2044,6 +2907,8 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
     default:          eyeL.setTarget(0,0);  eyeR.setTarget(0,0);  eyeL.setPupilSize(12,12); eyeR.setPupilSize(12,12); set_brow_line(eyeL,0);  set_brow_line(eyeR, 0); break;
   }
   
+  target_eye_color = COL_EYE[emo];
+  color_transition_progress = 0.0f;
   update_eye_color();
   scheduleNextBlink();
   last_activity_time = millis();
@@ -2058,7 +2923,6 @@ static void initWiFiNonBlocking() {
   uint32_t now = millis();
   
   if (!wifi_init_done) {
-    // First time initialization
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     
@@ -2079,12 +2943,10 @@ static void initWiFiNonBlocking() {
   }
   
   if (wifi_connecting) {
-    // Try to connect
     if (wifiMulti.run() == WL_CONNECTED) {
       wifi_connected = true;
       wifi_connecting = false;
 
-      // Print to serial
       Serial.print("Connected to WiFi! IP address: ");
       Serial.println(WiFi.localIP());
       
@@ -2093,15 +2955,12 @@ static void initWiFiNonBlocking() {
         lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x33FF99), 0);
       }
       
-      // Initialize time after WiFi connection
       initTime();
     }
     else if (now - wifi_start_time > WIFI_CONNECT_TIMEOUT) {
-      // Connection timeout
       wifi_connecting = false;
       
       #if ENABLE_WEB_SERVER
-      // Start AP mode if connection fails
       startAPMode();
       #else
       if (wifi_status_label) {
@@ -2150,7 +3009,6 @@ static void initTime() {
     }
   });
   
-  // Don't wait for sync - it will happen in background
   time_synced = false;
 }
 #endif
@@ -2282,7 +3140,6 @@ static void updateMoodMemory(Emotion e, float intensity) {
     mood_history[mood_history_count] = {e, millis(), intensity};
     mood_history_count++;
   } else {
-    // Shift array
     for (int i = 0; i < 23; i++) {
       mood_history[i] = mood_history[i + 1];
     }
@@ -2321,7 +3178,7 @@ static void calibrateAccelerometerZero() {
   
   accel_zero_x = sum_x / samples;
   accel_zero_y = sum_y / samples;
-  accel_zero_z = sum_z / samples - 1.0f; // Subtract gravity
+  accel_zero_z = sum_z / samples - 1.0f;
   
   accel_calibrated = true;
   saveSettings();
@@ -2345,8 +3202,6 @@ static void calibrateBlinkOffset() {
     blink_eyes(100);
     delay(2000);
     
-    // In a real implementation, you'd read serial commands
-    // For now, just save the original values
     BLINK_OFS_X = orig_x;
     BLINK_OFS_Y = orig_y;
     calibrating = false;
@@ -2359,7 +3214,6 @@ static void calibrateBlinkOffset() {
 static void autoCalibrateBlink() {
   Serial.println("Auto calibrating blink offset...");
   
-  // Simple auto-calibration that sets reasonable defaults
   BLINK_OFS_X = -12;
   BLINK_OFS_Y = -12;
   
@@ -2381,7 +3235,6 @@ static void updateTTS() {
     return;
   }
   
-  // Simple tone-based TTS - just play a tone for each character
   char c = current_tts_text[tts_text_pos];
   if (c != ' ') {
     float freq = 300 + (c % 26) * 50;
@@ -2389,18 +3242,16 @@ static void updateTTS() {
   }
   
   tts_text_pos++;
-  tts_next_char_time = now + 150; // 150ms per "character"
+  tts_next_char_time = now + 150;
 }
 #endif
 
 void setup() {
   Serial.begin(115200);
   
-  // Load all settings
   loadSettings();
   loadConfig();
   
-  // Initialize display
   tft.init(); 
   tft.setRotation(0); 
   tft.setBrightness(config.brightness); 
@@ -2414,7 +3265,6 @@ void setup() {
   delay(300);
   tft.fillScreen(TFT_BLACK);
 
-  // Initialize LVGL
   lv_init();
   size_t buf_size = SCR_W * DRAW_BUF_LINES;
   
@@ -2443,7 +3293,6 @@ void setup() {
 
   createTimeDisplay();
 
-  // Create eyes
   const int leftX  = (SCR_W - (2*EYE_W + 18)) / 2;
   const int rightX = leftX + EYE_W + 18;
   const int eyeY = 108 + 20;
@@ -2451,37 +3300,24 @@ void setup() {
   create_eye(eyeL, leftX, eyeY);
   create_eye(eyeR, rightX, eyeY);
 
-  // Create mouth
-  mouth = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(mouth, 24, 6);
-  lv_obj_set_style_radius(mouth, 3, 0);
-  lv_obj_set_style_bg_color(mouth, lv_color_hex(0xB0C9C6), 0);
-  lv_obj_set_style_bg_opa(mouth, LV_OPA_COVER, 0);
-  lv_obj_set_pos(mouth, (SCR_W-24)/2, 204 + 20);
+  initLipAnimation();
+  initAlarmSystem();
+  initParticleSystem();
   
-  lv_anim_t anim; 
-  lv_anim_init(&anim);
-  lv_anim_set_var(&anim, mouth);
-  lv_anim_set_time(&anim, 1500);
-  lv_anim_set_values(&anim, 20, 32);
-  lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_exec_cb(&anim, [](void *obj, int32_t v){
-    lv_obj_set_width((lv_obj_t*)obj, v);
-    lv_obj_set_x((lv_obj_t*)obj, (SCR_W - v)/2);
-  });
-  lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
-  lv_anim_start(&anim);
+  #if ENABLE_WIFI
+  if (config.weather_enabled) {
+    initWeatherDisplay();
+  }
+  #endif
 
   stars_init();
   
-  // Initialize hardware
   Wire.begin(I2C_SDA, I2C_SCL);
   MMA8452Q::init();
   
   i2s_mic_init();
   i2s_spk_init();
   
-  // Initialize music detection
   for(int i = 0; i < 8; i++) {
     beat_history[i] = 0;
   }
@@ -2494,7 +3330,6 @@ void setup() {
     calibrateAccelerometerZero();
   }
 
-  // Startup sound
   if (i2s_spk_init_success) {
     playTone(587.33f, 100, 0.35f);
     delay(50);
@@ -2503,14 +3338,13 @@ void setup() {
     playTone(988.00f, 150, 0.35f);
   }
 
-  // Start with normal emotion
   enhancedSetEmotion(EMO_NORMAL, false, true);
+  setLipShapeForEmotion(EMO_NORMAL);
   scheduleNextBlink();
   last_activity_time = millis();
   
   lvgl_initialized = true;
   
-  // Start WiFi in background (non-blocking)
   #if ENABLE_WIFI
   wifi_last_attempt = millis();
   if (wifi_connected) {
@@ -2519,8 +3353,8 @@ void setup() {
   }
   #endif
   
-  Serial.println("Emo Face Pro Ready!");
-  Serial.println("Core functionality started successfully");
+  Serial.println("Emo Face Pro v2.1 Ready!");
+  Serial.println("Features: Alarms, Smooth Transitions, Lip Animation, Weather");
 }
 
 void loop() {
@@ -2528,8 +3362,10 @@ void loop() {
   static uint32_t lastTimeUpdate = 0;
   static uint32_t lastScheduleCheck = 0;
   static uint32_t lastEmotionCheck = 0;
-  static Emotion detected_emotion = EMO_NORMAL;
   static uint32_t lastAccelUpdate = 0;
+  static uint32_t lastAlarmCheck = 0;
+  static uint32_t lastWeatherCheck = 0;
+  static Emotion detected_emotion = EMO_NORMAL;
   uint32_t now = millis();
   
   if (!lvgl_initialized) {
@@ -2537,18 +3373,18 @@ void loop() {
     return;
   }
 
-  // Handle LVGL updates
   if (now - lastLvglUpdate >= LVGL_UPDATE_MS) {
     lv_timer_handler();
     lastLvglUpdate = now;
+    
+    smoothEyeColorTransition();
+    updateParticles(current_emotion);
   }
 
-  // Handle web server
   #if ENABLE_WEB_SERVER
   handleWebServer();
   #endif
 
-  // Non-blocking WiFi connection
   #if ENABLE_WIFI
   if (!wifi_connected && !web_server_active) {
     initWiFiNonBlocking();
@@ -2559,28 +3395,35 @@ void loop() {
   }
   #endif
 
-  // Update time display every second
   if (now - lastTimeUpdate >= 1000) {
     lastTimeUpdate = now;
     updateTimeDisplay();
+    
+    if (now - lastAlarmCheck >= 60000) {
+      lastAlarmCheck = now;
+      checkAlarms();
+    }
   }
   
-  // Check sleep schedule every minute
   if (now - lastScheduleCheck >= 60000) {
     lastScheduleCheck = now;
     checkSleepSchedule();
   }
 
-  // Handle TTS
+  #if ENABLE_WIFI
+  if (now - lastWeatherCheck >= 1800000) {
+    lastWeatherCheck = now;
+    updateWeather();
+  }
+  #endif
+
   #if ENABLE_TTS
   if (tts_speaking) {
     updateTTS();
   }
   #endif
 
-  // Core functionality (runs regardless of WiFi status)
   if (!calibration_mode) {
-    // Accelerometer updates
     if (now - lastAccelUpdate >= 25) {
       lastAccelUpdate = now;
       
@@ -2627,7 +3470,6 @@ void loop() {
         }
         #endif
 
-        // Auto emotion detection
         if (config.auto_emotion && now - lastEmotionCheck > 500) {
           lastEmotionCheck = now;
           
@@ -2658,42 +3500,38 @@ void loop() {
             detected_emotion = e;
             enhancedSetEmotion(e);
             emotionBlip(e);
+            setLipShapeForEmotion(e);
           }
         }
       }
     }
 
-    // Music beat detection (enhanced sensitivity)
     #if ENABLE_MUSIC_BEAT_DETECTION
     static uint32_t last_beat_update = 0;
-    if (now - last_beat_update > 40) {  // Faster updates for more sensitivity
+    if (now - last_beat_update > 40) {
       last_beat_update = now;
       updateBeatDetection();
+      
+      updateLipAnimation(current_loudness, beat_detected);
     }
     #endif
 
-    // Update eye physics
     eyeL.updatePhysics();
     eyeR.updatePhysics();
     
-    // Emotion transition
     if (emotion_blend < 1.0f) {
       emotion_blend += emotion_transition_speed;
       if (emotion_blend > 1.0f) emotion_blend = 1.0f;
-      update_eye_color();
     }
 
-    // Blink
     if ((int32_t)(now - nextBlinkAt) >= 0 && !eyeL.is_blinking) {
       enhancedBlink();
       scheduleNextBlink();
     }
 
-    // Starlight background
     stars_draw();
   }
 
-  // Handle serial commands
   while (Serial.available()) {
     char c = Serial.read();
     if (c=='\n' || c=='\r') continue;
@@ -2789,12 +3627,33 @@ void loop() {
         eyeR.resetToCenter();
         break;
         
-      case 's':  // Web server toggle
+      case 's':
         #if ENABLE_WEB_SERVER
         if (!web_server_active) {
           startAPMode();
         }
         #endif
+        break;
+        
+      case 'A':
+        triggerAlarm(0);
+        break;
+        
+      case 'S':
+        stopAlarm();
+        break;
+        
+      case 'Z':
+        snoozeAlarm();
+        break;
+        
+      case 'L':
+        config.lip_sync_enabled = !config.lip_sync_enabled;
+        Serial.println("Lip sync: " + String(config.lip_sync_enabled ? "ON" : "OFF"));
+        break;
+        
+      case 'P':
+        spawnParticles(SCR_W/2, SCR_H/2, 10, current_eye_color);
         break;
     }
   }
