@@ -5,33 +5,17 @@
   Board: ESP32
   Display: ST7789 170x320 portrait, X offset 35
   Display Pins: SCK=14, MOSI=13, CS=15, DC=2, RST=4, BL=21
+  
+  *** IMPORTANT ACCELEROMETER ORIENTATION ***
+  MMA8452Q mounted with:
+  - X axis: Top/Bottom (Top = +X, Bottom = -X)
+  - Y axis: Left/Right (Left = +Y, Right = -Y)  
+  - Z axis: Forward/Backward (Forward = +Z, Backward = -Z)
+
   I2C (MMA8452Q): SDA=32, SCL=33
   
   I2S Mic: WS=27, BCLK=26, DOUT=25, SEL=GND (LEFT channel)
   I2S Out: DIN=19, BCLK=18, LRCLK=5
-
-  Enhanced Features:
-  1. Voice reactions for emotion changes
-  2. Music beat detection with visual sync
-  3. Silent night mode (mutes audio 11 PM - 7 AM)
-  4. Mood memory with persistence
-  5. Gesture-based quick actions
-  6. Time-based mood adjustments
-  7. Voice command support
-  8. Enhanced emotion transitions
-  9. Battery/power indicator
-  10. Smart idle behavior
-  11. Eyebrow music reactions
-  12. Enhanced TTS Engine
-  13. Dancing eyebrows to music
-  14. Jumping eyeballs with beat detection
-  15. Web configuration server
-  16. Non-blocking WiFi connection
-  17. Alarm System with Web Configuration
-  18. Smooth Eye Color Transitions
-  19. Lip Animation with Music Sync
-  20. Weather Display
-  21. Particle Effects System
 */
 
 #include <Arduino.h>
@@ -45,7 +29,6 @@
 #include <esp_wifi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <HTTPClient.h>
 
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
@@ -89,7 +72,7 @@
 #define MIC_SOFT_GAIN      0.5f  
 
 #define MUSIC_THRESHOLD 0.2f    
-#define BEAT_DECAY 0.95f
+#define BEAT_DECAY 0.7f
 
 #define TTS_SAMPLE_RATE 8000
 #define TTS_BUFFER_SIZE 512
@@ -104,11 +87,14 @@ WebServer webServer(80);
 DNSServer dnsServer;
 const byte DNS_PORT = 53;
 bool web_server_active = false;
+bool ap_mode = false;
 String ap_ssid = "EmoFacePro-AP";
 String ap_password = "12345678";
 
 // ================== Alarm System Config =================
 #define MAX_ALARMS 5
+#define ALARM_RING_DURATION 30000  // 30 seconds of continuous ringing
+#define ALARM_SNOOZE_DURATION 300000  // 5 minutes snooze
 
 // ================== Hardware Pins =================
 static const int I2C_SDA = 32;
@@ -119,8 +105,8 @@ static const int SCR_H = 320;
 static const int EYE_W = 56;
 static const int EYE_H = 44;
 
-static int BLINK_OFS_X = -12;
-static int BLINK_OFS_Y = -12;
+static int BLINK_OFS_X = 0;
+static int BLINK_OFS_Y = 0;
 
 // Web configurable settings
 static struct {
@@ -139,12 +125,8 @@ static struct {
   int brightness = 255;
   
   // New settings
-  float color_transition_speed = 0.02f;
   bool lip_sync_enabled = true;
   int lip_sync_sensitivity = 5;
-  bool weather_enabled = false;
-  String weather_api_key = "";
-  String weather_city = "London";
   bool notifications_enabled = true;
   int alarm_volume = 7;
 } config;
@@ -165,13 +147,13 @@ static const lv_color_t COL_BG    = lv_color_hex(0x000000);
 static const lv_color_t COL_PUPIL = lv_color_hex(0xFFFFFF);
 
 static const lv_color_t COL_EYE[7] = {
-  lv_color_hex(0x00E5FF),
-  lv_color_hex(0xFF3366),
-  lv_color_hex(0x33FF99),
-  lv_color_hex(0xFFCC00),
-  lv_color_hex(0x9966FF),
-  lv_color_hex(0xFF6600),
-  lv_color_hex(0x00CCFF)
+  lv_color_hex(0x00E5FF),  // Normal - Light Blue
+  lv_color_hex(0xFF3366),  // Angry - Red
+  lv_color_hex(0x33FF99),  // Happy - Green
+  lv_color_hex(0xFFCC00),  // Curious - Yellow
+  lv_color_hex(0x9966FF),  // Sleepy - Purple
+  lv_color_hex(0xFF6600),  // Excited - Orange
+  lv_color_hex(0x00CCFF)   // Sad - Blue
 };
 
 enum Emotion { EMO_NORMAL=0, EMO_ANGRY, EMO_HAPPY, EMO_CURIOUS, EMO_SLEEPY, EMO_EXCITED, EMO_SAD, EMO_COUNT };
@@ -191,7 +173,7 @@ static const uint32_t GESTURE_COOLDOWN = 2000;
 static const uint32_t VOICE_COMMAND_TIMEOUT = 5000;
 
 static const int DRAW_BUF_LINES = 15;
-static const uint32_t LVGL_UPDATE_MS = 20;
+static const uint32_t LVGL_UPDATE_MS = 5;
 static const uint32_t POWER_SAVE_TIMEOUT = 300000;
 static const uint32_t WIFI_CONNECT_TIMEOUT = 10000;  
 static const uint32_t WIFI_RETRY_INTERVAL = 60000;  
@@ -213,27 +195,18 @@ static bool alarm_triggered = false;
 static int current_alarm_index = -1;
 static uint32_t alarm_start_time = 0;
 static uint32_t last_alarm_check = 0;
+static uint32_t last_alarm_beep = 0;
+static bool alarm_ringing = false;
+static int alarm_ring_counter = 0;
 static lv_obj_t *alarm_label = nullptr;
 
-// ================== Smooth Color Transition ==================
-static lv_color_t current_eye_color = COL_EYE[EMO_NORMAL];
-static lv_color_t target_eye_color = COL_EYE[EMO_NORMAL];
-static float color_transition_progress = 1.0f;
-
-// ================== Lip Animation ==================
+// ================== Enhanced Lip Animation ==================
 static lv_obj_t *mouth_top = nullptr;
 static lv_obj_t *mouth_bottom = nullptr;
 static float lip_openness = 0.5f;
 static uint32_t last_lip_update = 0;
-
-// ================== Weather Display ==================
-#if ENABLE_WIFI
-static String weather_temp = "--";
-static String weather_condition = "";
-static uint32_t last_weather_update = 0;
-static const uint32_t WEATHER_UPDATE_INTERVAL = 1800000;
-static lv_obj_t *weather_label = nullptr;
-#endif
+static float target_lip_openness = 0.5f;
+static float lip_transition_progress = 1.0f;
 
 // ================== Particle System ==================
 static lv_obj_t *particles[20];
@@ -331,13 +304,13 @@ struct Eye {
   int pupil_dx=0, pupil_dy=0;
   int target_dx=0, target_dy=0;
   bool is_blinking=false;
-  float k=0.3f, d=0.8f, vx=0, vy=0;
+  float k=0.4f, d=0.7f, vx=0, vy=0;
   int x=0, y=0;
   
   float music_dx = 0;
   float music_dy = 0;
   uint32_t last_beat_time = 0;
-  float beat_decay = 0.9f;
+  float beat_decay = 0.7f;
 
   void updatePhysics() {
     float ax = (target_dx - pupil_dx)*k - vx*d;
@@ -353,21 +326,15 @@ struct Eye {
     pupil_dy = constrain(pupil_dy, -max_dy, max_dy);
 
     if (pupil) {
-      int center_x = (EYE_W - pupil_w) / 2;
-      int center_y = (EYE_H - pupil_h) / 2;
-      
-      int pupil_x = center_x + pupil_dx;
-      int pupil_y = center_y + pupil_dy;
-      
-      lv_obj_set_pos(pupil, pupil_x, pupil_y);
+      lv_obj_set_pos(pupil, 
+          (EYE_W - pupil_w)/2 + pupil_dx,
+          (EYE_H - pupil_h)/2 + pupil_dy);
     }
     
     if (glint) {
-      int center_x = (EYE_W - pupil_w) / 2;
-      int center_y = (EYE_H - pupil_h) / 2;
       lv_obj_set_pos(glint, 
-          center_x + pupil_dx - 4,
-          center_y + pupil_dy - 4);
+          (EYE_W - pupil_w)/2 + pupil_dx - 4,
+          (EYE_H - pupil_h)/2 + pupil_dy - 4);
     }
     
     music_dx *= beat_decay;
@@ -413,7 +380,7 @@ static Eye eyeL, eyeR;
 static Emotion current_emotion=EMO_NORMAL, target_emotion=EMO_NORMAL, prev_emotion=EMO_NORMAL;
 static Emotion last_stable_emotion=EMO_NORMAL;
 static float emotion_blend=1.0f;
-static const float emotion_transition_speed=0.08f;
+static const float emotion_transition_speed=0.15f;
 static uint16_t blink_speed=120;
 static uint32_t nextBlinkAt=0;
 static uint32_t emotion_stable_since=0;
@@ -425,6 +392,11 @@ static bool time_synced = false;
 static bool scheduled_sleep = false;
 static bool lvgl_initialized = false;
 
+// ACCELEROMETER CALIBRATION - ADJUSTED FOR NEW ORIENTATION
+// When device is flat on table facing forward:
+// X (top/bottom): 0g
+// Y (left/right): 0g  
+// Z (forward/backward): -1g (gravity pulling backward)
 static float accel_zero_x = 0;
 static float accel_zero_y = 0;
 static float accel_zero_z = -1.0f;
@@ -487,6 +459,7 @@ static uint32_t tts_next_char_time = 0;
 
 // ================== FORWARD DECLARATIONS ==================
 static void playTone(float freq, int ms, float vol = 0.35f);
+static void playMelody(const float* notes, const int* durations, int count, float vol = 0.35f);
 static void set_emotion(Emotion emo, bool proofBlink = true);
 static void enhancedSetEmotion(Emotion emo, bool withVoice = true, bool immediate = false);
 static void updateMoodMemory(Emotion e, float intensity);
@@ -531,23 +504,15 @@ static void checkAlarms();
 static void triggerAlarm(int alarm_index);
 static void stopAlarm();
 static void snoozeAlarm();
+static void updateAlarmRinging();
 static String getNextAlarmTime();
 static int countActiveAlarms();
 
-static void smoothEyeColorTransition();
-static lv_color_t interpolateColor(lv_color_t c1, lv_color_t c2, float ratio);
-static void update_eye_color();
-
-static void initLipAnimation();
+// Enhanced animation functions
 static void updateLipAnimation(float loudness, bool beat_detected);
 static void setLipShapeForEmotion(Emotion e);
 static void lipSyncToMusic(float loudness, float bpm);
-
-#if ENABLE_WIFI
-static void initWeatherDisplay();
-static void updateWeather();
-static void fetchWeatherData();
-#endif
+static void updateLipTransition();
 
 static void initParticleSystem();
 static void updateParticles(Emotion e);
@@ -559,20 +524,18 @@ static void handleAlarms();
 static void handleSaveAlarm();
 static void handleDeleteAlarm();
 static void handleTestAlarm();
-static void handleWeatherSettings();
-static void handleSaveWeatherSettings();
 #endif
 
 static inline void set_top_lid(void *obj, int32_t v) {
   lv_obj_t *o = (lv_obj_t*)obj;
   lv_obj_set_height(o, v);
-  lv_obj_set_pos(o, BLINK_OFS_X, BLINK_OFS_Y);
+  lv_obj_set_pos(o, 0, 0);
 }
 
 static inline void set_bottom_lid(void *obj, int32_t v) {
   lv_obj_t *o = (lv_obj_t*)obj;
   lv_obj_set_height(o, v);
-  lv_obj_set_pos(o, BLINK_OFS_X, EYE_H - v + BLINK_OFS_Y);
+  lv_obj_set_pos(o, 0, EYE_H - v);
 }
 
 static void set_brow_line(Eye &e, int tilt) {
@@ -589,6 +552,8 @@ static void create_eye(Eye &e, int x, int y) {
   lv_obj_set_size(e.eye, EYE_W, EYE_H);
   lv_obj_set_pos(e.eye, x, y);
   lv_obj_add_style(e.eye, &style_eye, 0);
+  lv_style_set_bg_color(&style_eye, COL_EYE[EMO_NORMAL]);
+  lv_style_set_shadow_color(&style_eye, COL_EYE[EMO_NORMAL]);
   
   lv_obj_clear_flag(e.eye, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_pad_all(e.eye, 0, 0);
@@ -623,14 +588,14 @@ static void create_eye(Eye &e, int x, int y) {
 
   e.lidTop = lv_obj_create(e.eye);
   lv_obj_set_size(e.lidTop, EYE_W, 0);
-  lv_obj_set_pos(e.lidTop, BLINK_OFS_X, BLINK_OFS_Y);
+  lv_obj_set_pos(e.lidTop, 0, 0);
   lv_obj_set_style_bg_color(e.lidTop, COL_BG, 0);
   lv_obj_set_style_bg_opa(e.lidTop, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(e.lidTop, 0, 0);
 
   e.lidBot = lv_obj_create(e.eye);
   lv_obj_set_size(e.lidBot, EYE_W, 0);
-  lv_obj_set_pos(e.lidBot, BLINK_OFS_X, EYE_H + BLINK_OFS_Y);
+  lv_obj_set_pos(e.lidBot, 0, EYE_H);
   lv_obj_set_style_bg_color(e.lidBot, COL_BG, 0);
   lv_obj_set_style_bg_opa(e.lidBot, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(e.lidBot, 0, 0);
@@ -693,8 +658,8 @@ static void blink_one(Eye &e, uint16_t t_ms) {
   lv_timer_t *cleanup = lv_timer_create([](lv_timer_t *t){
     Eye *ee = (Eye*)t->user_data;
     if (ee && ee->lidTop && ee->lidBot) {
-      lv_obj_set_pos(ee->lidTop, BLINK_OFS_X, BLINK_OFS_Y);
-      lv_obj_set_pos(ee->lidBot, BLINK_OFS_X, EYE_H + BLINK_OFS_Y);
+      lv_obj_set_pos(ee->lidTop, 0, 0);
+      lv_obj_set_pos(ee->lidBot, 0, EYE_H);
     }
     lv_timer_del(t);
   }, t_ms + 40, &e);
@@ -714,61 +679,159 @@ static void blink_eyes(uint16_t t) {
   (void)done;
 }
 
-// ================== SMOOTH EYE COLOR TRANSITION ==================
-static void update_eye_color() {
-  if (color_transition_progress < 1.0f) {
-    color_transition_progress += config.color_transition_speed;
-    if (color_transition_progress > 1.0f) color_transition_progress = 1.0f;
-    
-    current_eye_color = interpolateColor(current_eye_color, target_eye_color, 
-                                         color_transition_progress);
+static void playTone(float freq, int ms, float vol) {
+  if (power_save_mode || !i2s_spk_init_success || scheduled_sleep) return;
+  
+  const int N = (SPK_SAMPLE_RATE * ms)/1000;
+  int16_t frame[2];
+  size_t bytesWritten;
+  for (int n=0;n<N;n++) {
+    float t = (float)n / SPK_SAMPLE_RATE;
+    float s = sinf(2.0f * 3.1415926f * freq * t);
+    int16_t v = (int16_t)(s * vol * 32767);
+    frame[0]=v; frame[1]=v;
+    i2s_write(SPK_PORT, frame, sizeof(frame), &bytesWritten, portMAX_DELAY);
+  }
+}
+
+static void playMelody(const float* notes, const int* durations, int count, float vol) {
+  if (power_save_mode || !i2s_spk_init_success || scheduled_sleep) return;
+  
+  for (int i = 0; i < count; i++) {
+    playTone(notes[i], durations[i], vol);
+    delay(durations[i] * 0.8f); // Short pause between notes
+  }
+}
+
+static void emotionAudioNotification(Emotion e) {
+  if (power_save_mode || !i2s_spk_init_success || scheduled_sleep || !config.notifications_enabled) return;
+  
+  // Adjust volume based on time of day
+  float volume_multiplier = 1.0f;
+  int current_hour = getCurrentHour();
+  if (current_hour >= 22 || current_hour <= 7) { // Quiet hours
+    volume_multiplier = 0.3f;
   }
   
-  lv_style_set_bg_color(&style_eye, current_eye_color);
-  lv_style_set_shadow_color(&style_eye, current_eye_color);
-  lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-  lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-  
-  lv_style_set_line_color(&style_brow, current_eye_color);
-  lv_obj_refresh_style(eyeL.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-  lv_obj_refresh_style(eyeR.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-}
-
-static lv_color_t interpolateColor(lv_color_t c1, lv_color_t c2, float ratio) {
-  if (ratio <= 0.0f) return c1;
-  if (ratio >= 1.0f) return c2;
-  
-  uint8_t r1 = (c1.full >> 11) & 0x1F;
-  uint8_t g1 = (c1.full >> 5) & 0x3F;
-  uint8_t b1 = c1.full & 0x1F;
-  
-  uint8_t r2 = (c2.full >> 11) & 0x1F;
-  uint8_t g2 = (c2.full >> 5) & 0x3F;
-  uint8_t b2 = c2.full & 0x1F;
-  
-  uint8_t r = (uint8_t)(r1 + (r2 - r1) * ratio);
-  uint8_t g = (uint8_t)(g1 + (g2 - g1) * ratio);
-  uint8_t b = (uint8_t)(b1 + (b2 - b1) * ratio);
-  
-  return lv_color_make(r << 3, g << 2, b << 3);
-}
-
-static void smoothEyeColorTransition() {
-  if (color_transition_progress < 1.0f) {
-    color_transition_progress += config.color_transition_speed;
-    if (color_transition_progress > 1.0f) color_transition_progress = 1.0f;
+  switch(e){
+    case EMO_SLEEPY: {
+      // Gentle descending lullaby with reverb effect
+      float notes[] = {440.0f, 392.0f, 349.2f, 329.6f, 293.7f, 261.6f};
+      int durations[] = {300, 300, 300, 300, 400, 600};
+      for (int i = 0; i < 6; i++) {
+        playTone(notes[i], durations[i], 0.15f * volume_multiplier);
+        if (i < 5) delay(50); // Small pause between notes
+      }
+    } break;
     
-    current_eye_color = interpolateColor(current_eye_color, target_eye_color, 
-                                         color_transition_progress);
+    case EMO_SAD: {
+      // Slow, melancholic minor progression with echo
+      float notes[] = {523.3f, 493.9f, 440.0f, 392.0f, 349.2f, 329.6f};
+      int durations[] = {400, 400, 400, 400, 600, 800};
+      for (int i = 0; i < 6; i++) {
+        playTone(notes[i], durations[i], 0.2f * volume_multiplier);
+        // Add echo
+        if (i < 3) {
+          delay(100);
+          playTone(notes[i] * 0.5f, durations[i]/2, 0.1f * volume_multiplier);
+        }
+        if (i < 5) delay(100);
+      }
+    } break;
     
-    lv_style_set_bg_color(&style_eye, current_eye_color);
-    lv_style_set_shadow_color(&style_eye, current_eye_color);
-    lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-    lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+    case EMO_NORMAL: {
+      // Calm, reassuring tones
+      float notes[] = {392.0f, 440.0f, 523.3f, 587.3f, 659.3f};
+      int durations[] = {200, 200, 200, 200, 400};
+      for (int i = 0; i < 5; i++) {
+        playTone(notes[i], durations[i], 0.18f * volume_multiplier);
+        delay(80);
+      }
+    } break;
     
-    lv_style_set_line_color(&style_brow, current_eye_color);
-    lv_obj_refresh_style(eyeL.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
-    lv_obj_refresh_style(eyeR.brow, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+    case EMO_CURIOUS: {
+      // Rising, questioning pattern with arpeggio
+      float base_freq = 440.0f;
+      for (int i = 0; i < 4; i++) {
+        float freq = base_freq * pow(2, i/12.0f);
+        playTone(freq, 150, 0.25f * volume_multiplier);
+        delay(120);
+      }
+      // Quick descending run
+      for (int i = 3; i >= 0; i--) {
+        float freq = base_freq * pow(2, i/12.0f);
+        playTone(freq, 100, 0.2f * volume_multiplier);
+        delay(80);
+      }
+    } break;
+    
+    case EMO_HAPPY: {
+      // Upbeat, happy major progression with harmony
+      float melody[] = {523.3f, 659.3f, 784.0f, 880.0f};
+      float harmony[] = {392.0f, 493.9f, 587.3f, 698.5f};
+      int durations[] = {150, 150, 150, 300};
+      
+      for (int i = 0; i < 4; i++) {
+        // Play chord (melody + harmony)
+        int16_t frame[2];
+        size_t bytesWritten;
+        int N = (SPK_SAMPLE_RATE * durations[i])/1000;
+        
+        for (int n=0;n<N;n++) {
+          float t = (float)n / SPK_SAMPLE_RATE;
+          float s1 = sinf(2.0f * 3.1415926f * melody[i] * t);
+          float s2 = sinf(2.0f * 3.1415926f * harmony[i] * t);
+          float s = (s1 + s2) * 0.5f;
+          int16_t v = (int16_t)(s * 0.3f * volume_multiplier * 32767);
+          frame[0]=v; frame[1]=v;
+          i2s_write(SPK_PORT, frame, sizeof(frame), &bytesWritten, portMAX_DELAY);
+        }
+        
+        if (i < 3) delay(100);
+      }
+    } break;
+    
+    case EMO_EXCITED: {
+      // Fast, energetic sequence with crescendo
+      for (int repeat = 0; repeat < 2; repeat++) {
+        float base = 440.0f;
+        for (int i = 0; i < 8; i++) {
+          float freq = base * (1.0f + i * 0.1f);
+          int duration = 60 + i * 10;
+          float vol = 0.25f + (i * 0.02f);
+          playTone(freq, duration, vol * volume_multiplier);
+          delay(40);
+        }
+        if (repeat == 0) delay(200);
+      }
+    } break;
+    
+    case EMO_ANGRY: {
+      // Aggressive, dissonant pattern with percussive elements
+      float freqs[] = {196.0f, 233.1f, 261.6f, 311.1f, 349.2f};
+      for (int i = 0; i < 5; i++) {
+        // Main tone
+        playTone(freqs[i], 120, 0.35f * volume_multiplier);
+        
+        // Add percussive element (high frequency burst)
+        if (i % 2 == 0) {
+          delay(20);
+          playTone(freqs[i] * 2.5f, 40, 0.2f * volume_multiplier);
+        }
+        
+        delay(100);
+      }
+      
+      // Final low rumble
+      playTone(130.8f, 500, 0.4f * volume_multiplier);
+    } break;
+    
+    default: {
+      // Pleasant two-tone notification
+      playTone(523.3f, 200, 0.25f * volume_multiplier);
+      delay(150);
+      playTone(659.3f, 250, 0.25f * volume_multiplier);
+    } break;
   }
 }
 
@@ -818,8 +881,11 @@ static void set_emotion(Emotion emo, bool proofBlink) {
   target_emotion = emo; 
   current_emotion = emo;
   
-  target_eye_color = COL_EYE[emo];
-  color_transition_progress = 0.0f;
+  // Immediate color change (no transition)
+  lv_style_set_bg_color(&style_eye, COL_EYE[emo]);
+  lv_style_set_shadow_color(&style_eye, COL_EYE[emo]);
+  lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
   
   last_stable_emotion = emo;
   emotion_stable_since = millis();
@@ -836,7 +902,6 @@ static void set_emotion(Emotion emo, bool proofBlink) {
   }
   
   setLipShapeForEmotion(emo);
-  update_eye_color();
   scheduleNextBlink();
   if (proofBlink) nextBlinkAt = millis() + 400;
 }
@@ -866,12 +931,8 @@ static void saveConfig() {
   preferences.putInt("brightness", config.brightness);
   
   // New settings
-  preferences.putFloat("color_speed", config.color_transition_speed);
   preferences.putBool("lip_sync", config.lip_sync_enabled);
   preferences.putInt("lip_sens", config.lip_sync_sensitivity);
-  preferences.putBool("weather_en", config.weather_enabled);
-  preferences.putString("weather_key", config.weather_api_key);
-  preferences.putString("weather_city", config.weather_city);
   preferences.putBool("notifications", config.notifications_enabled);
   preferences.putInt("alarm_vol", config.alarm_volume);
   
@@ -897,12 +958,8 @@ static void loadConfig() {
   config.brightness = preferences.getInt("brightness", 255);
   
   // New settings
-  config.color_transition_speed = preferences.getFloat("color_speed", 0.02f);
   config.lip_sync_enabled = preferences.getBool("lip_sync", true);
   config.lip_sync_sensitivity = preferences.getInt("lip_sens", 5);
-  config.weather_enabled = preferences.getBool("weather_en", false);
-  config.weather_api_key = preferences.getString("weather_key", "");
-  config.weather_city = preferences.getString("weather_city", "London");
   config.notifications_enabled = preferences.getBool("notifications", true);
   config.alarm_volume = preferences.getInt("alarm_vol", 7);
   
@@ -959,7 +1016,7 @@ static void handleRoot() {
   html += wifi_connected ? "✅ Connected (" + WiFi.SSID() + ")" : "❌ Disconnected";
   html += "</p>";
   html += "<p><strong>IP Address:</strong> ";
-  html += wifi_connected ? WiFi.localIP().toString() : "N/A";
+  html += wifi_connected ? WiFi.localIP().toString() : (ap_mode ? WiFi.softAPIP().toString() : "N/A");
   html += "</p>";
   html += "<p><strong>Time:</strong> ";
   html += time_synced ? "✅ Synchronized" : "❌ Not synchronized";
@@ -1019,16 +1076,6 @@ static void handleRoot() {
   html += "<input type='range' name='brightness' min='10' max='100' value='";
   html += String(config.brightness);
   html += "' oninput=\"brightnessValue.innerHTML=this.value+'%'\">";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Color Transition Speed: <span class='range-value' id='colorSpeedValue'>";
-  html += String(config.color_transition_speed, 2);
-  html += "</span></label>";
-  html += "<div class='range-container'>";
-  html += "<span>Slow</span><input type='range' name='color_speed' min='0.01' max='0.1' step='0.01' value='";
-  html += String(config.color_transition_speed, 2);
-  html += "' oninput=\"colorSpeedValue.innerHTML=parseFloat(this.value).toFixed(2)\"><span>Fast</span>";
-  html += "</div>";
   html += "</div>";
   html += "</div>";
   
@@ -1161,34 +1208,6 @@ static void handleRoot() {
   html += "</div>";
   html += "</div>";
   
-  // Weather Settings
-  html += "<div class='section'>";
-  html += "<h2>🌤️ Weather Settings</h2>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='weather_enabled' name='weather_enabled' ";
-  html += config.weather_enabled ? "checked" : "";
-  html += " onchange='toggleWeatherFields(this.checked)'>";
-  html += "<label for='weather_enabled'>Enable Weather Display</label>";
-  html += "</div>";
-  html += "<div class='form-group' id='weatherFields' style='";
-  if (!config.weather_enabled) html += "display:none;";
-  html += "'>";
-  html += "<label for='weather_api_key'>OpenWeatherMap API Key:</label>";
-  html += "<input type='text' id='weather_api_key' name='weather_api_key' value='";
-  html += config.weather_api_key;
-  html += "' placeholder='Enter API key'>";
-  html += "<small>Get free API key from openweathermap.org</small>";
-  html += "</div>";
-  html += "<div class='form-group' id='weatherCityField' style='";
-  if (!config.weather_enabled) html += "display:none;";
-  html += "'>";
-  html += "<label for='weather_city'>City:</label>";
-  html += "<input type='text' id='weather_city' name='weather_city' value='";
-  html += config.weather_city;
-  html += "' placeholder='e.g., London, New York'>";
-  html += "</div>";
-  html += "</div>";
-  
   html += "<div class='form-group' style='text-align:center;'>";
   html += "<button type='submit' class='btn'>💾 Save All Settings</button>";
   html += "</div>";
@@ -1239,7 +1258,7 @@ static void handleRoot() {
   html += "<p>Emo Face Pro v2.1 | ";
   html += __DATE__;
   html += " | ";
-  html += wifi_connected ? "Connected" : "AP Mode";
+  html += wifi_connected ? "Station Mode" : (ap_mode ? "AP Mode" : "Disconnected");
   html += "</p>";
   html += "</div>";
   
@@ -1260,17 +1279,13 @@ static void handleRoot() {
   html += "  }";
   html += "  return true;";
   html += "}";
-  html += "function toggleWeatherFields(enabled) {";
-  html += "  document.getElementById('weatherFields').style.display = enabled ? 'block' : 'none';";
-  html += "  document.getElementById('weatherCityField').style.display = enabled ? 'block' : 'none';";
-  html += "}";
   html += "document.addEventListener('DOMContentLoaded', function() {";
   html += "  var sliders = document.querySelectorAll('input[type=range]');";
   html += "  sliders.forEach(function(slider) {";
   html += "    slider.addEventListener('input', function() {";
   html += "      var valueDisplay = this.parentElement.querySelector('.range-value');";
   html += "      if(valueDisplay) {";
-  html += "        if(this.name === 'brightness') {";
+        html += "        if(this.name === 'brightness') {";
   html += "          valueDisplay.innerHTML = this.value + '%';";
   html += "        } else {";
   html += "          valueDisplay.innerHTML = this.value;";
@@ -1312,16 +1327,10 @@ static void handleSave() {
       } else if (name == "brightness") {
         config.brightness = value.toInt();
         updateBrightness();
-      } else if (name == "color_speed") {
-        config.color_transition_speed = value.toFloat();
       } else if (name == "lip_sync_sensitivity") {
         config.lip_sync_sensitivity = value.toInt();
       } else if (name == "alarm_volume") {
         config.alarm_volume = value.toInt();
-      } else if (name == "weather_api_key") {
-        config.weather_api_key = value;
-      } else if (name == "weather_city") {
-        config.weather_city = value;
       } else if (name == "auto_emotion") {
         config.auto_emotion = true;
       } else if (name == "voice_reactions") {
@@ -1332,8 +1341,6 @@ static void handleSave() {
         config.lip_sync_enabled = true;
       } else if (name == "notifications_enabled") {
         config.notifications_enabled = true;
-      } else if (name == "weather_enabled") {
-        config.weather_enabled = true;
       }
     }
     
@@ -1342,7 +1349,6 @@ static void handleSave() {
     if (!webServer.hasArg("music_reactions")) config.music_reactions = false;
     if (!webServer.hasArg("lip_sync_enabled")) config.lip_sync_enabled = false;
     if (!webServer.hasArg("notifications_enabled")) config.notifications_enabled = false;
-    if (!webServer.hasArg("weather_enabled")) config.weather_enabled = false;
     
     saveConfig();
     
@@ -1369,6 +1375,17 @@ static void handleSave() {
 
 static void handleCalibrate() {
   calibration_mode = true;
+  Serial.println("Entering calibration mode...");
+  Serial.println("Place device flat on a surface and press 'c' to calibrate accelerometer");
+  Serial.println("Press 'x' to reset calibration");
+  Serial.println("Press 'a' to auto-calibrate blink");
+  
+  // Show calibration message on screen
+  lv_obj_t *calib_msg = lv_label_create(lv_scr_act());
+  lv_label_set_text(calib_msg, "CALIBRATION MODE\nPlace device flat\nPress 'c' to calibrate\nPress 'x' to reset");
+  lv_obj_align(calib_msg, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_text_align(calib_msg, LV_TEXT_ALIGN_CENTER, 0);
+  
   String html = "<html><body><h1>Calibration Mode Activated</h1>";
   html += "<p>Check serial monitor for calibration instructions.</p>";
   html += "<p><a href='/'>Back to config</a></p></body></html>";
@@ -1445,7 +1462,7 @@ static void handleTestEmotion() {
   static int emotion_index = 0;
   Emotion emotions[] = {EMO_NORMAL, EMO_HAPPY, EMO_SAD, EMO_EXCITED, EMO_ANGRY, EMO_CURIOUS, EMO_SLEEPY};
   
-  enhancedSetEmotion(emotions[emotion_index], false);
+  enhancedSetEmotion(emotions[emotion_index], true);
   emotion_index = (emotion_index + 1) % 7;
   
   String html = "<html><body><h1>Emotion Test</h1>";
@@ -1546,7 +1563,7 @@ static void handleAlarms() {
   html += ".alarm-type{display:flex;gap:10px;margin:10px 0;}";
   html += ".type-option{padding:10px;border:2px solid #ddd;border-radius:5px;cursor:pointer;background:#fff;}";
   html += ".type-option.active{border-color:#667eea;background:#e8f0fe;}";
-  html += ".switch{position:relative;display:inline-block;width:60px;height:34px;}";
+  html += ".switch{position:relative;display:inline-block;width:60px;height=34px;}";
   html += ".switch input{opacity:0;width:0;height:0;}";
   html += ".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:34px;}";
   html += ".slider:before{position:absolute;content:\"\";height:26px;width:26px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%;}";
@@ -1756,6 +1773,7 @@ static void handleDeleteAlarm() {
 
 static void startAPMode() {
   WiFi.mode(WIFI_AP);
+  ap_mode = true;
   
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -1781,9 +1799,6 @@ static void startAPMode() {
   Serial.print("AP IP address: ");
   Serial.println(apIP);
   
-  dnsServer.start(DNS_PORT, "*", apIP);
-  Serial.println("DNS server started");
-  
   initWebServer();
   
   web_server_active = true;
@@ -1797,7 +1812,7 @@ static void startAPMode() {
   Serial.println("=== Access Point Started ===");
   Serial.println("Connect to WiFi: " + ap_ssid);
   Serial.println("Password: " + ap_password);
-  Serial.println("Open browser to: http://192.168.4.1");
+  Serial.println("Open browser to: http://" + apIP.toString());
   Serial.println("=============================");
   
   if (i2s_spk_init_success) {
@@ -1842,11 +1857,6 @@ static void initWebServer() {
 static void handleWebServer() {
   if (web_server_active) {
     webServer.handleClient();
-    #if ENABLE_WIFI
-    if (WiFi.getMode() == WIFI_AP) {
-      dnsServer.processNextRequest();
-    }
-    #endif
   }
 }
 
@@ -2069,38 +2079,6 @@ static float mic_read_loudness() {
   return fminf(1.0f, scaled_peak);
 }
 
-static void playTone(float freq, int ms, float vol) {
-  if (power_save_mode || !i2s_spk_init_success || scheduled_sleep) return;
-  
-  const int N = (SPK_SAMPLE_RATE * ms)/1000;
-  int16_t frame[2];
-  size_t bytesWritten;
-  for (int n=0;n<N;n++) {
-    float t = (float)n / SPK_SAMPLE_RATE;
-    float s = sinf(2.0f * 3.1415926f * freq * t);
-    int16_t v = (int16_t)(s * vol * 32767);
-    frame[0]=v; frame[1]=v;
-    i2s_write(SPK_PORT, frame, sizeof(frame), &bytesWritten, portMAX_DELAY);
-  }
-}
-
-static void emotionBlip(Emotion e) {
-  if (power_save_mode || !i2s_spk_init_success || scheduled_sleep) return;
-  
-  float f = 880.0f;
-  switch(e){
-    case EMO_SLEEPY:  f=440; break;
-    case EMO_SAD:     f=523; break;
-    case EMO_NORMAL:  f=659; break;
-    case EMO_CURIOUS: f=740; break;
-    case EMO_HAPPY:   f=784; break;
-    case EMO_EXCITED: f=988; break;
-    case EMO_ANGRY:   f=622; break;
-    default: break;
-  }
-  playTone(f, 80, 0.35f);
-}
-
 // ================== ALARM SYSTEM ==================
 static void initAlarmSystem() {
   for (int i = 0; i < MAX_ALARMS; i++) {
@@ -2195,10 +2173,13 @@ static void triggerAlarm(int alarm_index) {
   alarm_triggered = true;
   current_alarm_index = alarm_index;
   alarm_start_time = millis();
+  alarm_ringing = true;
+  alarm_ring_counter = 0;
   
   Alarm &alarm = alarms[alarm_index];
   
   Serial.println("ALARM TRIGGERED: " + alarm.label);
+  Serial.println("Alarm will ring continuously for " + String(ALARM_RING_DURATION/1000) + " seconds");
   
   if (alarm_label) {
     lv_label_set_text(alarm_label, ("⏰ " + alarm.label).c_str());
@@ -2206,36 +2187,59 @@ static void triggerAlarm(int alarm_index) {
   }
   
   enhancedSetEmotion(EMO_EXCITED, false);
+}
+
+static void updateAlarmRinging() {
+  if (!alarm_triggered || !alarm_ringing) return;
   
-  switch(alarm.type) {
-    case 0:
-      for(int i = 0; i < 5; i++) {
-        playTone(440 + i*55, 200, config.alarm_volume * 0.05f);
-        delay(300);
-      }
-      break;
-      
-    case 1:
-      for(int i = 0; i < 10; i++) {
-        playTone(880, 100, config.alarm_volume * 0.08f);
-        delay(200);
-        if (i % 2 == 0) blink_eyes(60);
-      }
-      break;
-      
-    case 2:
-      for(int i = 0; i < 20; i++) {
-        playTone(523 + (i%3)*110, 80, config.alarm_volume * 0.1f);
-        delay(100);
-        if (i % 3 == 0) {
+  uint32_t now = millis();
+  if (now - alarm_start_time > ALARM_RING_DURATION) {
+    // Alarm has been ringing long enough, stop it
+    stopAlarm();
+    return;
+  }
+  
+  // Ring continuously with different patterns based on alarm type
+  if (now - last_alarm_beep > 500) { // Update every 500ms
+    last_alarm_beep = now;
+    alarm_ring_counter++;
+    
+    Alarm &alarm = alarms[current_alarm_index];
+    float volume = config.alarm_volume * 0.1f;
+    
+    switch(alarm.type) {
+      case 0: // Gentle
+        if (alarm_ring_counter % 4 == 0) {
+          playTone(440, 300, volume * 0.6f);
+          blink_eyes(80);
+        }
+        break;
+        
+      case 1: // Standard
+        if (alarm_ring_counter % 2 == 0) {
+          playTone(880, 200, volume * 0.8f);
+          blink_eyes(60);
+        }
+        if (alarm_ring_counter % 8 == 0) {
+          playTone(523, 400, volume * 0.8f);
+        }
+        break;
+        
+      case 2: // Energetic
+        playTone(440 + (alarm_ring_counter % 3) * 110, 100, volume);
+        if (alarm_ring_counter % 4 == 0) {
+          blink_eyes(40);
+          // Make eyes flash red
           lv_obj_set_style_bg_color(eyeL.eye, lv_color_hex(0xFF6600), 0);
           lv_obj_set_style_bg_color(eyeR.eye, lv_color_hex(0xFF6600), 0);
-        } else {
-          lv_obj_set_style_bg_color(eyeL.eye, COL_EYE[EMO_EXCITED], 0);
-          lv_obj_set_style_bg_color(eyeR.eye, COL_EYE[EMO_EXCITED], 0);
+          lv_timer_t *reset_color = lv_timer_create([](lv_timer_t *t){
+            lv_obj_set_style_bg_color(eyeL.eye, COL_EYE[EMO_EXCITED], 0);
+            lv_obj_set_style_bg_color(eyeR.eye, COL_EYE[EMO_EXCITED], 0);
+            lv_timer_del(t);
+          }, 100, nullptr);
         }
-      }
-      break;
+        break;
+    }
   }
 }
 
@@ -2243,6 +2247,7 @@ static void stopAlarm() {
   if (!alarm_triggered) return;
   
   alarm_triggered = false;
+  alarm_ringing = false;
   
   if (alarm_label) {
     lv_label_set_text(alarm_label, "");
@@ -2267,6 +2272,7 @@ static void snoozeAlarm() {
   }, alarms[current_alarm_index].snooze_minutes * 60000, (void*)(intptr_t)current_alarm_index);
   
   stopAlarm();
+  enhancedSetEmotion(EMO_SLEEPY, false);
 }
 
 static String getNextAlarmTime() {
@@ -2287,7 +2293,7 @@ static int countActiveAlarms() {
   return count;
 }
 
-// ================== LIP ANIMATION ==================
+// ================== ENHANCED LIP ANIMATION ==================
 static void initLipAnimation() {
   mouth_top = lv_obj_create(lv_scr_act());
   lv_obj_set_size(mouth_top, 32, 6);
@@ -2307,6 +2313,16 @@ static void initLipAnimation() {
   lv_obj_move_foreground(mouth_bottom);
 }
 
+static void updateLipTransition() {
+  if (lip_transition_progress < 1.0f) {
+    lip_transition_progress += 0.05f;
+    if (lip_transition_progress > 1.0f) lip_transition_progress = 1.0f;
+    
+    float eased_progress = lip_transition_progress * lip_transition_progress * (3.0f - 2.0f * lip_transition_progress);
+    lip_openness = lip_openness * (1.0f - eased_progress) + target_lip_openness * eased_progress;
+  }
+}
+
 static void updateLipAnimation(float loudness, bool beat_detected) {
   if (!config.lip_sync_enabled || scheduled_sleep) return;
   
@@ -2315,19 +2331,44 @@ static void updateLipAnimation(float loudness, bool beat_detected) {
   
   last_lip_update = now;
   
+  updateLipTransition();
+  
   if (loudness > 0.1f && config.music_reactions) {
     lipSyncToMusic(loudness, beat_bpm);
     return;
   }
   
+  // Breathing animation when no music
   float breath = sin(millis() * 0.002f) * 0.3f + 0.7f;
-  int height = 6 * breath;
-  int separation = 2 + (int)(sin(millis() * 0.001f) * 1.5f);
+  float current_openness = lip_openness * breath;
   
-  lv_obj_set_height(mouth_top, height);
-  lv_obj_set_height(mouth_bottom, height);
+  int height = 3 + (int)(current_openness * 9);
+  int separation = 2 + (int)((1.0f - current_openness) * 3);
   
-  int mouth_width = 28 + (int)(sin(millis() * 0.0005f) * 4);
+  // Smooth animation using LVGL animations
+  lv_anim_t anim_top, anim_bottom;
+  lv_anim_init(&anim_top);
+  lv_anim_init(&anim_bottom);
+  
+  lv_anim_set_var(&anim_top, mouth_top);
+  lv_anim_set_var(&anim_bottom, mouth_bottom);
+  lv_anim_set_time(&anim_top, 100);
+  lv_anim_set_time(&anim_bottom, 100);
+  
+  lv_anim_set_values(&anim_top, lv_obj_get_height(mouth_top), height);
+  lv_anim_set_values(&anim_bottom, lv_obj_get_height(mouth_bottom), height);
+  
+  lv_anim_set_exec_cb(&anim_top, [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  });
+  lv_anim_set_exec_cb(&anim_bottom, [](void *obj, int32_t v) {
+    lv_obj_set_height((lv_obj_t*)obj, v);
+  });
+  
+  lv_anim_start(&anim_top);
+  lv_anim_start(&anim_bottom);
+  
+  int mouth_width = 28 + (int)(current_openness * 12);
   lv_obj_set_width(mouth_top, mouth_width);
   lv_obj_set_width(mouth_bottom, mouth_width);
   
@@ -2339,12 +2380,16 @@ static void updateLipAnimation(float loudness, bool beat_detected) {
 static void lipSyncToMusic(float loudness, float bpm) {
   float time = millis() * 0.001f;
   
+  // Multiple sine waves for complex lip movement
   float movement1 = sin(time * bpm * 0.01f) * 0.5f + 0.5f;
   float movement2 = sin(time * bpm * 0.02f + 1.0f) * 0.3f;
   float movement3 = cos(time * bpm * 0.005f + 2.0f) * 0.2f;
   
   float openness = (movement1 + movement2 + movement3) * loudness * 2.0f;
   openness = constrain(openness, 0.0f, 1.0f);
+  
+  target_lip_openness = openness;
+  lip_transition_progress = 0.0f;
   
   int max_height = 12;
   int min_height = 2;
@@ -2364,6 +2409,8 @@ static void lipSyncToMusic(float loudness, float bpm) {
   lv_anim_set_var(&anim_bottom, mouth_bottom);
   lv_anim_set_time(&anim_top, 80);
   lv_anim_set_time(&anim_bottom, 80);
+  lv_anim_set_path_cb(&anim_top, lv_anim_path_ease_out);
+  lv_anim_set_path_cb(&anim_bottom, lv_anim_path_ease_out);
   
   lv_anim_set_values(&anim_top, lv_obj_get_height(mouth_top), height);
   lv_anim_set_values(&anim_bottom, lv_obj_get_height(mouth_bottom), height);
@@ -2384,6 +2431,7 @@ static void lipSyncToMusic(float loudness, float bpm) {
   lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
   lv_obj_set_y(mouth_bottom, 200 + height + separation);
   
+  // Color intensity based on loudness
   uint8_t color_intensity = 160 + (int)(openness * 95);
   lv_color_t lip_color = lv_color_make(color_intensity, 40, 40);
   lv_obj_set_style_bg_color(mouth_top, lip_color, 0);
@@ -2393,38 +2441,52 @@ static void lipSyncToMusic(float loudness, float bpm) {
 static void setLipShapeForEmotion(Emotion e) {
   if (!config.lip_sync_enabled) return;
   
-  int top_height, bottom_height, width, separation;
+  float target_openness;
+  int width;
   lv_color_t color = lv_color_hex(0xD43F3F);
   
   switch(e) {
     case EMO_HAPPY:
-      top_height = 4; bottom_height = 6; width = 36; separation = 0;
+      target_openness = 0.8f;
+      width = 36;
       color = lv_color_hex(0xFF3366);
       break;
     case EMO_SAD:
-      top_height = 3; bottom_height = 3; width = 30; separation = 4;
+      target_openness = 0.3f;
+      width = 30;
       color = lv_color_hex(0x9933CC);
       break;
     case EMO_EXCITED:
-      top_height = 6; bottom_height = 8; width = 40; separation = 1;
+      target_openness = 0.9f;
+      width = 40;
       color = lv_color_hex(0xFF6600);
       break;
     case EMO_ANGRY:
-      top_height = 3; bottom_height = 3; width = 28; separation = 2;
+      target_openness = 0.4f;
+      width = 28;
       color = lv_color_hex(0xFF0000);
       break;
     case EMO_SLEEPY:
-      top_height = 2; bottom_height = 2; width = 24; separation = 0;
+      target_openness = 0.2f;
+      width = 24;
       color = lv_color_hex(0x9966FF);
       break;
     case EMO_CURIOUS:
-      top_height = 3; bottom_height = 4; width = 26; separation = 3;
+      target_openness = 0.5f;
+      width = 26;
       color = lv_color_hex(0x33CCCC);
       break;
     default:
-      top_height = 4; bottom_height = 4; width = 32; separation = 2;
+      target_openness = 0.5f;
+      width = 32;
       break;
   }
+  
+  target_lip_openness = target_openness;
+  lip_transition_progress = 0.0f;
+  
+  int height = 3 + (int)(target_openness * 9);
+  int separation = 2 + (int)((1.0f - target_openness) * 3);
   
   lv_anim_t anim;
   lv_anim_init(&anim);
@@ -2432,14 +2494,14 @@ static void setLipShapeForEmotion(Emotion e) {
   lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
   
   lv_anim_set_var(&anim, mouth_top);
-  lv_anim_set_values(&anim, lv_obj_get_height(mouth_top), top_height);
+  lv_anim_set_values(&anim, lv_obj_get_height(mouth_top), height);
   lv_anim_set_exec_cb(&anim, [](void *obj, int32_t v) {
     lv_obj_set_height((lv_obj_t*)obj, v);
   });
   lv_anim_start(&anim);
   
   lv_anim_set_var(&anim, mouth_bottom);
-  lv_anim_set_values(&anim, lv_obj_get_height(mouth_bottom), bottom_height);
+  lv_anim_set_values(&anim, lv_obj_get_height(mouth_bottom), height);
   anim.exec_cb = [](void *obj, int32_t v) {
     lv_obj_set_height((lv_obj_t*)obj, v);
   };
@@ -2449,87 +2511,11 @@ static void setLipShapeForEmotion(Emotion e) {
   lv_obj_set_width(mouth_bottom, width);
   lv_obj_set_x(mouth_top, (SCR_W - width)/2);
   lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
-  lv_obj_set_y(mouth_bottom, 200 + top_height + separation);
+  lv_obj_set_y(mouth_bottom, 200 + height + separation);
   
   lv_obj_set_style_bg_color(mouth_top, color, 0);
   lv_obj_set_style_bg_color(mouth_bottom, color, 0);
 }
-
-#if ENABLE_WIFI
-static void initWeatherDisplay() {
-  if (!config.weather_enabled) return;
-  
-  weather_label = lv_label_create(lv_scr_act());
-  lv_obj_add_style(weather_label, &style_time_text, 0);
-  lv_obj_set_width(weather_label, SCR_W);
-  lv_obj_set_pos(weather_label, 0, 70);
-  lv_label_set_text(weather_label, "Weather: --°C");
-  lv_obj_set_style_text_align(weather_label, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_color(weather_label, lv_color_hex(0x33FF99), 0);
-}
-
-static void updateWeather() {
-  if (!config.weather_enabled || !wifi_connected) return;
-  
-  uint32_t now = millis();
-  if (now - last_weather_update < WEATHER_UPDATE_INTERVAL) return;
-  
-  last_weather_update = now;
-  fetchWeatherData();
-}
-
-static void fetchWeatherData() {
-  if (config.weather_api_key == "") return;
-  
-  WiFiClient client;
-  HTTPClient http;
-  
-  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + 
-               config.weather_city + 
-               "&appid=" + config.weather_api_key + 
-               "&units=metric";
-  
-  http.begin(client, url);
-  int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    
-    int temp_start = payload.indexOf("\"temp\":") + 7;
-    int temp_end = payload.indexOf(",", temp_start);
-    if (temp_start > 6 && temp_end > temp_start) {
-      weather_temp = payload.substring(temp_start, temp_end);
-    }
-    
-    int desc_start = payload.indexOf("\"description\":\"") + 15;
-    int desc_end = payload.indexOf("\"", desc_start);
-    if (desc_start > 14 && desc_end > desc_start) {
-      weather_condition = payload.substring(desc_start, desc_end);
-    }
-    
-    if (weather_label) {
-      String display_text = "🌡 " + weather_temp + "°C";
-      if (weather_condition != "") {
-        display_text += " " + weather_condition;
-      }
-      lv_label_set_text(weather_label, display_text.c_str());
-    }
-    
-    if (weather_condition.indexOf("rain") >= 0) {
-      enhancedSetEmotion(EMO_SAD);
-    } else if (weather_condition.indexOf("clear") >= 0) {
-      enhancedSetEmotion(EMO_HAPPY);
-    } else if (weather_condition.indexOf("cloud") >= 0) {
-      enhancedSetEmotion(EMO_NORMAL);
-    }
-    
-  } else {
-    Serial.println("Weather fetch failed: " + String(httpCode));
-  }
-  
-  http.end();
-}
-#endif
 
 // ================== PARTICLE SYSTEM ==================
 static void initParticleSystem() {
@@ -2743,6 +2729,7 @@ static void updateBeatDetection() {
 }
 
 #if ENABLE_GESTURES
+// UPDATED GESTURE DETECTION FOR NEW ACCELEROMETER ORIENTATION
 static Gesture detectGesture(float ax, float ay, float az) {
   static float last_ax = 0, last_ay = 0, last_az = 0;
   
@@ -2758,22 +2745,23 @@ static Gesture detectGesture(float ax, float ay, float az) {
     return GESTURE_SHAKE;
   }
   
-  static float z_history[5] = {0};
-  static int z_index = 0;
-  z_history[z_index] = az;
-  z_index = (z_index + 1) % 5;
+  static float x_history[5] = {0}; // Now using X axis (top/bottom) for nod detection
+  static int x_index = 0;
+  x_history[x_index] = ax;
+  x_index = (x_index + 1) % 5;
   
   int direction_changes = 0;
   for(int i = 1; i < 5; i++) {
-    if ((z_history[i] - z_history[i-1]) * (z_history[i-1] - z_history[i-2]) < 0) {
+    if ((x_history[i] - x_history[i-1]) * (x_history[i-1] - x_history[i-2]) < 0) {
       direction_changes++;
     }
   }
   
-  if (direction_changes >= 3 && fabs(az) > 0.3f) {
+  if (direction_changes >= 3 && fabs(ax) > 0.3f) {
     return GESTURE_NOD;
   }
   
+  // For tilt detection, now use Y axis (left/right)
   if (ay < -0.4f) return GESTURE_TILT_LEFT;
   if (ay > 0.4f) return GESTURE_TILT_RIGHT;
   
@@ -2865,13 +2853,19 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
     emotion_blend = 0.0f;
   }
   
+  // Immediate color change (no transition)
+  lv_style_set_bg_color(&style_eye, COL_EYE[emo]);
+  lv_style_set_shadow_color(&style_eye, COL_EYE[emo]);
+  lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  
   #if ENABLE_MOOD_MEMORY
   float intensity = 1.0f;
   updateMoodMemory(emo, intensity);
   #endif
   
   if (withVoice && !scheduled_sleep && config.voice_reactions) {
-    emotionBlip(emo);
+    emotionAudioNotification(emo);
   }
   
   setLipShapeForEmotion(emo);
@@ -2907,9 +2901,6 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
     default:          eyeL.setTarget(0,0);  eyeR.setTarget(0,0);  eyeL.setPupilSize(12,12); eyeR.setPupilSize(12,12); set_brow_line(eyeL,0);  set_brow_line(eyeR, 0); break;
   }
   
-  target_eye_color = COL_EYE[emo];
-  color_transition_progress = 0.0f;
-  update_eye_color();
   scheduleNextBlink();
   last_activity_time = millis();
   emotion_stable_since = millis();
@@ -2946,6 +2937,7 @@ static void initWiFiNonBlocking() {
     if (wifiMulti.run() == WL_CONNECTED) {
       wifi_connected = true;
       wifi_connecting = false;
+      ap_mode = false;
 
       Serial.print("Connected to WiFi! IP address: ");
       Serial.println(WiFi.localIP());
@@ -2955,6 +2947,7 @@ static void initWiFiNonBlocking() {
         lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x33FF99), 0);
       }
       
+      initWebServer();
       initTime();
     }
     else if (now - wifi_start_time > WIFI_CONNECT_TIMEOUT) {
@@ -2979,7 +2972,7 @@ static void reconnectWiFiIfNeeded() {
   if (now - last_check > WIFI_RETRY_INTERVAL) {
     last_check = now;
     
-    if (WiFi.status() != WL_CONNECTED && !wifi_connecting) {
+    if (WiFi.status() != WL_CONNECTED && !wifi_connecting && !ap_mode) {
       wifi_connected = false;
       wifi_connecting = true;
       wifi_last_attempt = now;
@@ -3107,8 +3100,8 @@ static void saveSettings() {
 
 static void loadSettings() {
   preferences.begin("face", true);
-  BLINK_OFS_X = preferences.getInt("blinkX", -12);
-  BLINK_OFS_Y = preferences.getInt("blinkY", -12);
+  BLINK_OFS_X = preferences.getInt("blinkX", 0);
+  BLINK_OFS_Y = preferences.getInt("blinkY", 0);
   
   accel_zero_x = preferences.getFloat("accelZeroX", 0.0f);
   accel_zero_y = preferences.getFloat("accelZeroY", 0.0f);
@@ -3159,13 +3152,41 @@ static void loadMoodHistory() {
   preferences.end();
 }
 
-static void calibrateAccelerometerZero() {
-  if (!MMA8452Q::present) return;
+// Helper function to check device stability
+static bool isDeviceStable(float ax, float ay, float az, float threshold = 0.1f) {
+  static float prev_ax = 0, prev_ay = 0, prev_az = 0;
+  static uint32_t stable_start = 0;
   
-  Serial.println("Calibrating accelerometer... Keep device flat and still.");
+  float change = fabs(ax - prev_ax) + fabs(ay - prev_ay) + fabs(az - prev_az);
+  
+  prev_ax = ax;
+  prev_ay = ay;
+  prev_az = az;
+  
+  if (change < threshold) {
+    if (stable_start == 0) {
+      stable_start = millis();
+    }
+    // Device has been stable for 1 second
+    return (millis() - stable_start) > 1000;
+  } else {
+    stable_start = 0;
+    return false;
+  }
+}
+
+// UPDATED CALIBRATION FOR NEW ACCELEROMETER ORIENTATION
+static void calibrateAccelerometerZero() {
+  if (!MMA8452Q::present) {
+    Serial.println("Accelerometer not found!");
+    return;
+  }
+  
+  Serial.println("Calibrating accelerometer... Keep device flat on table facing forward.");
+  Serial.println("Expected readings when flat: X=0, Y=0, Z=-1.0g");
   
   float sum_x = 0, sum_y = 0, sum_z = 0;
-  const int samples = 100;
+  const int samples = 200;
   
   for (int i = 0; i < samples; i++) {
     float ax, ay, az;
@@ -3176,36 +3197,47 @@ static void calibrateAccelerometerZero() {
     delay(10);
   }
   
-  accel_zero_x = sum_x / samples;
-  accel_zero_y = sum_y / samples;
-  accel_zero_z = sum_z / samples - 1.0f;
+  // Calculate averages
+  accel_zero_x = sum_x / samples; // Should be ~0 when flat
+  accel_zero_y = sum_y / samples; // Should be ~0 when flat
+  accel_zero_z = (sum_z / samples) + 1.0f; // Should be ~0 when flat (since actual reading is -1.0g)
   
   accel_calibrated = true;
   saveSettings();
   
   Serial.println("Calibration complete!");
+  Serial.printf("Raw averages: X=%.3f, Y=%.3f, Z=%.3f\n", 
+                sum_x/samples, sum_y/samples, sum_z/samples);
   Serial.printf("Zero offsets: X=%.3f, Y=%.3f, Z=%.3f\n", 
                 accel_zero_x, accel_zero_y, accel_zero_z);
+  Serial.println("Note: Z offset includes +1.0g correction for gravity");
+  
+  // Visual confirmation
+  enhancedSetEmotion(EMO_HAPPY, false);
+  for(int i = 0; i < 3; i++) {
+    playTone(880 + i*110, 100, 0.3f);
+    delay(150);
+  }
 }
 
 static void calibrateBlinkOffset() {
   Serial.println("Blink offset calibration mode");
-  Serial.println("Use arrow keys to adjust, Enter to save, Esc to cancel");
+  Serial.println("Adjusting blink offset...");
   
-  int orig_x = BLINK_OFS_X;
-  int orig_y = BLINK_OFS_Y;
-  
-  bool calibrating = true;
-  while (calibrating) {
-    Serial.printf("Current offset: X=%d, Y=%d\n", BLINK_OFS_X, BLINK_OFS_Y);
-    
-    blink_eyes(100);
-    delay(2000);
-    
-    BLINK_OFS_X = orig_x;
-    BLINK_OFS_Y = orig_y;
-    calibrating = false;
+  // Test different offsets
+  for(int x = -20; x <= 0; x += 5) {
+    for(int y = -20; y <= 0; y += 5) {
+      BLINK_OFS_X = x;
+      BLINK_OFS_Y = y;
+      Serial.printf("Testing X=%d, Y=%d\n", x, y);
+      blink_eyes(100);
+      delay(1000);
+    }
   }
+  
+  // Reset to default
+  BLINK_OFS_X = 0;
+  BLINK_OFS_Y = 0;
   
   saveSettings();
   Serial.println("Blink offset calibration saved");
@@ -3214,11 +3246,18 @@ static void calibrateBlinkOffset() {
 static void autoCalibrateBlink() {
   Serial.println("Auto calibrating blink offset...");
   
-  BLINK_OFS_X = -12;
-  BLINK_OFS_Y = -12;
+  // Simple auto-calibration - use defaults
+  BLINK_OFS_X = 0;
+  BLINK_OFS_Y = 0;
   
   saveSettings();
-  Serial.println("Auto calibration complete");
+  Serial.println("Auto calibration complete - using default offsets");
+  
+  // Visual confirmation
+  enhancedSetEmotion(EMO_HAPPY, false);
+  playTone(523, 200, 0.3f);
+  delay(100);
+  playTone(659, 200, 0.3f);
 }
 
 #if ENABLE_TTS
@@ -3248,6 +3287,8 @@ static void updateTTS() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("Starting Emo Face Pro v2.1...");
+  Serial.println("Accelerometer orientation: X=Top/Bottom, Y=Left/Right, Z=Forward/Backward");
   
   loadSettings();
   loadConfig();
@@ -3275,6 +3316,7 @@ void setup() {
     lvBuf1 = (lv_color_t*)malloc(buf_size * sizeof(lv_color_t));
     lvBuf2 = (lv_color_t*)malloc(buf_size * sizeof(lv_color_t));
     if (!lvBuf1 || !lvBuf2) {
+      Serial.println("Failed to allocate LVGL buffers!");
       while(1) delay(1000);
     }
   }
@@ -3303,17 +3345,15 @@ void setup() {
   initLipAnimation();
   initAlarmSystem();
   initParticleSystem();
-  
-  #if ENABLE_WIFI
-  if (config.weather_enabled) {
-    initWeatherDisplay();
-  }
-  #endif
 
   stars_init();
   
   Wire.begin(I2C_SDA, I2C_SCL);
-  MMA8452Q::init();
+  if (!MMA8452Q::init()) {
+    Serial.println("MMA8452Q not found!");
+  } else {
+    Serial.println("MMA8452Q initialized");
+  }
   
   i2s_mic_init();
   i2s_spk_init();
@@ -3327,15 +3367,14 @@ void setup() {
   #endif
   
   if (MMA8452Q::present && !accel_calibrated) {
-    calibrateAccelerometerZero();
+    Serial.println("Accelerometer needs calibration");
   }
 
   if (i2s_spk_init_success) {
-    playTone(587.33f, 100, 0.35f);
-    delay(50);
-    playTone(784.00f, 120, 0.35f);
-    delay(50);
-    playTone(988.00f, 150, 0.35f);
+    // Play startup melody
+    float startup_notes[] = {523.3f, 659.3f, 784.0f, 987.8f, 1174.7f};
+    int startup_durations[] = {150, 150, 150, 150, 300};
+    playMelody(startup_notes, startup_durations, 5, 0.3f);
   }
 
   enhancedSetEmotion(EMO_NORMAL, false, true);
@@ -3347,14 +3386,30 @@ void setup() {
   
   #if ENABLE_WIFI
   wifi_last_attempt = millis();
-  if (wifi_connected) {
-    Serial.print("Connected! IP address: ");
-    Serial.println(WiFi.localIP());
-  }
   #endif
   
+  Serial.println("======================================");
   Serial.println("Emo Face Pro v2.1 Ready!");
-  Serial.println("Features: Alarms, Smooth Transitions, Lip Animation, Weather");
+  Serial.println("Features: Improved Audio Notifications, Continuous Alarms");
+  Serial.println("Accelerometer: X=Top/Bottom, Y=Left/Right, Z=Forward/Backward");
+  Serial.println("Serial Commands:");
+  Serial.println("  0-6: Change emotion");
+  Serial.println("  b: Blink");
+  Serial.println("  c: Calibrate accelerometer");
+  Serial.println("  x: Reset calibration");
+  Serial.println("  a: Auto-calibrate blink");
+  Serial.println("  p: Toggle power save");
+  Serial.println("  w: Toggle WiFi");
+  Serial.println("  r: Reconnect WiFi");
+  Serial.println("  n: Normal emotion");
+  Serial.println("  o: Center pupils");
+  Serial.println("  s: Start AP mode");
+  Serial.println("  A: Test alarm (rings for 30 seconds)");
+  Serial.println("  S: Stop alarm");
+  Serial.println("  Z: Snooze alarm");
+  Serial.println("  L: Toggle lip sync");
+  Serial.println("  P: Spawn particles");
+  Serial.println("======================================");
 }
 
 void loop() {
@@ -3364,7 +3419,6 @@ void loop() {
   static uint32_t lastEmotionCheck = 0;
   static uint32_t lastAccelUpdate = 0;
   static uint32_t lastAlarmCheck = 0;
-  static uint32_t lastWeatherCheck = 0;
   static Emotion detected_emotion = EMO_NORMAL;
   uint32_t now = millis();
   
@@ -3377,7 +3431,7 @@ void loop() {
     lv_timer_handler();
     lastLvglUpdate = now;
     
-    smoothEyeColorTransition();
+    updateLipTransition();
     updateParticles(current_emotion);
   }
 
@@ -3386,7 +3440,7 @@ void loop() {
   #endif
 
   #if ENABLE_WIFI
-  if (!wifi_connected && !web_server_active) {
+  if (!wifi_connected && !web_server_active && !ap_mode) {
     initWiFiNonBlocking();
   }
   
@@ -3410,12 +3464,10 @@ void loop() {
     checkSleepSchedule();
   }
 
-  #if ENABLE_WIFI
-  if (now - lastWeatherCheck >= 1800000) {
-    lastWeatherCheck = now;
-    updateWeather();
+  // Update alarm ringing continuously
+  if (alarm_triggered) {
+    updateAlarmRinging();
   }
-  #endif
 
   #if ENABLE_TTS
   if (tts_speaking) {
@@ -3424,21 +3476,25 @@ void loop() {
   #endif
 
   if (!calibration_mode) {
-    if (now - lastAccelUpdate >= 25) {
+    if (now - lastAccelUpdate >= 10) {
       lastAccelUpdate = now;
       
       if (MMA8452Q::present) {
         float ax, ay, az;
         MMA8452Q::read(ax, ay, az);
         
+        // Apply calibration offsets
         if (accel_calibrated) {
           ax -= accel_zero_x;
           ay -= accel_zero_y;
           az -= accel_zero_z;
         }
         
-        int dx = (int)(-ay * 12.0f);
-        int dy = (int)(ax * 10.0f);
+        // UPDATED PUPIL MOVEMENT FOR NEW ORIENTATION
+        // X axis (top/bottom) controls vertical pupil movement
+        // Y axis (left/right) controls horizontal pupil movement
+        int dx = (int)(-ay * 12.0f);  // Use Y axis for horizontal movement
+        int dy = (int)(-ax * 10.0f);  // Use X axis for vertical movement (inverted)
         
         if (abs(dx) < 2) dx = 0;
         if (abs(dy) < 2) dy = 0;
@@ -3449,7 +3505,10 @@ void loop() {
         eyeL.setTarget(dx, dy);
         eyeR.setTarget(dx, dy);
         
-        int pupil_adjust = (int)((az + 1.0f) * 6.0f);
+        // Z axis (forward/backward) controls pupil size
+        // When leaning forward (Z positive), pupils get smaller
+        // When leaning backward (Z negative), pupils get larger
+        int pupil_adjust = (int)((az + 1.0f) * 6.0f);  // Z ranges from -1 to +1
         pupil_adjust = constrain(pupil_adjust, -6, 6);
         
         int base_size = 12;
@@ -3470,39 +3529,63 @@ void loop() {
         }
         #endif
 
-        if (config.auto_emotion && now - lastEmotionCheck > 500) {
+        // =========== IMPROVED EMOTION DETECTION ===========
+        if (config.auto_emotion && now - lastEmotionCheck > 1000) {  // Check every 1 second
           lastEmotionCheck = now;
           
-          float xy_magnitude = sqrtf(ax * ax + ay * ay);
+          // Check device orientation for emotion detection
+          bool is_stable = isDeviceStable(ax, ay, az, 0.08f);
           
-          Emotion e = EMO_NORMAL;
+          Emotion e = detected_emotion; // Start with current emotion
           
-          if (xy_magnitude > 0.8f) {  
-            e = EMO_EXCITED;
-          } 
-          else if (az > 0.6f) {  
-            e = EMO_CURIOUS;
-          } 
-          else if (az < -0.6f) {  
-            e = EMO_SAD;
-          } 
-          else if (ay < -0.5f) {  
-            e = EMO_ANGRY;
-          } 
-          else if (ay > 0.5f) {  
-            e = EMO_HAPPY;
+          if (is_stable) {
+            // Device is stable - detect emotion based on orientation
+            if (az > 0.7f) {  // Leaning forward
+              e = EMO_CURIOUS;
+            } 
+            else if (az < -0.7f) {  // Leaning backward
+              e = EMO_SAD;
+            }
+            else if (ay > 0.6f) {  // Tilted left (positive Y)
+              e = EMO_ANGRY;
+            } 
+            else if (ay < -0.6f) {  // Tilted right (negative Y)
+              e = EMO_HAPPY;
+            }
+            else if (ax > 0.6f) {  // Top down (positive X)
+              e = EMO_EXCITED;
+            }
+            else if (ax < -0.6f) {  // Bottom up (negative X)
+              e = EMO_SLEEPY;
+            }
+            else {
+              // Device is flat and stable
+              e = EMO_NORMAL;
+            }
           }
-          else if (az < -0.4f && xy_magnitude < 0.2f) {
-            e = EMO_SLEEPY;
+          else {
+            // Device is moving/shaking
+            float movement_magnitude = sqrtf(ax*ax + ay*ay + az*az);
+            if (movement_magnitude > 1.2f) {
+              e = EMO_EXCITED;
+            }
           }
           
+          // Only update if emotion changed
           if (e != detected_emotion) {
             detected_emotion = e;
             enhancedSetEmotion(e);
-            emotionBlip(e);
+            
+            // Play sound for emotion changes (except when returning to normal quietly)
+            if (e != EMO_NORMAL || !is_stable) {
+              emotionAudioNotification(e);
+            }
+            
             setLipShapeForEmotion(e);
+            last_activity_time = now;
           }
         }
+        // =================================================
       }
     }
 
@@ -3542,29 +3625,34 @@ void loop() {
       case '0': case '1': case '2': case '3': case '4': case '5': case '6': {
         Emotion e = (Emotion)(c - '0');
         enhancedSetEmotion(e);
-        emotionBlip(e);
+        emotionAudioNotification(e);
+        Serial.print("Emotion set to: ");
+        Serial.println(e);
       } break;
       
       case 'b': 
         enhancedBlink(); 
+        Serial.println("Blink triggered");
         break;
         
       case 't': 
         starlight_enabled = !starlight_enabled; 
+        Serial.print("Starlight: ");
+        Serial.println(starlight_enabled ? "ON" : "OFF");
         break;
         
       case 'c': 
-        calibrateBlinkOffset(); 
+        if (MMA8452Q::present) {
+          calibrateAccelerometerZero();
+          Serial.println("Accelerometer calibrated");
+        } else {
+          Serial.println("Accelerometer not present!");
+        }
         break;
         
       case 'a':
         autoCalibrateBlink();
-        break;
-        
-      case 'z':
-        if (MMA8452Q::present) {
-          calibrateAccelerometerZero();
-        }
+        Serial.println("Blink auto-calibrated");
         break;
         
       case 'x':
@@ -3574,12 +3662,15 @@ void loop() {
         accel_calibrated = false;
         saveSettings();
         set_emotion(EMO_NORMAL);
+        Serial.println("Calibration reset");
         break;
         
       case 'p': 
         if (!scheduled_sleep) {
           power_save_mode = !power_save_mode;
           tft.setBrightness(power_save_mode ? 30 : config.brightness);
+          Serial.print("Power save: ");
+          Serial.println(power_save_mode ? "ON" : "OFF");
         }
         break;
         
@@ -3593,11 +3684,13 @@ void loop() {
             lv_label_set_text(wifi_status_label, "WiFi: OFF");
             lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFF3366), 0);
           }
+          Serial.println("WiFi disabled");
         } else {
           WiFi.mode(WIFI_STA);
           wifi_connected = false;
           wifi_connecting = true;
           wifi_last_attempt = millis();
+          Serial.println("WiFi enabled - connecting...");
         }
         #endif
         break;
@@ -3610,50 +3703,65 @@ void loop() {
         wifi_connected = false;
         wifi_connecting = true;
         wifi_last_attempt = millis();
+        Serial.println("WiFi reconnecting...");
         #endif
         break;
         
       case 'n':
         enhancedSetEmotion(EMO_NORMAL);
+        Serial.println("Normal emotion");
         break;
         
       case 'v':
         voice_command_mode = true;
         voice_command_start = millis();
+        Serial.println("Voice command mode");
         break;
         
       case 'o':
         eyeL.resetToCenter();
         eyeR.resetToCenter();
+        Serial.println("Pupils centered");
         break;
         
       case 's':
         #if ENABLE_WEB_SERVER
         if (!web_server_active) {
           startAPMode();
+          Serial.println("AP mode started");
         }
         #endif
         break;
         
       case 'A':
         triggerAlarm(0);
+        Serial.println("Test alarm triggered - will ring for 30 seconds");
         break;
         
       case 'S':
         stopAlarm();
+        Serial.println("Alarm stopped");
         break;
         
       case 'Z':
         snoozeAlarm();
+        Serial.println("Alarm snoozed for 5 minutes");
         break;
         
       case 'L':
         config.lip_sync_enabled = !config.lip_sync_enabled;
-        Serial.println("Lip sync: " + String(config.lip_sync_enabled ? "ON" : "OFF"));
+        Serial.print("Lip sync: ");
+        Serial.println(config.lip_sync_enabled ? "ON" : "OFF");
         break;
         
       case 'P':
-        spawnParticles(SCR_W/2, SCR_H/2, 10, current_eye_color);
+        spawnParticles(SCR_W/2, SCR_H/2, 10, COL_EYE[current_emotion]);
+        Serial.println("Particles spawned");
+        break;
+        
+      default:
+        Serial.print("Unknown command: ");
+        Serial.println(c);
         break;
     }
   }
