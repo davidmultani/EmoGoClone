@@ -213,6 +213,13 @@ static lv_obj_t *particles[20];
 static bool particles_active = false;
 static uint32_t particle_last_update = 0;
 
+// ================== Idle Animation ==================
+static uint32_t last_idle_update = 0;
+static uint32_t next_wander_time = 0;
+static int wander_target_x = 0;
+static int wander_target_y = 0;
+static bool is_wandering = false;
+
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ST7789 _panel;
   lgfx::Bus_SPI      _bus;
@@ -518,6 +525,11 @@ static void initParticleSystem();
 static void updateParticles(Emotion e);
 static void spawnParticles(int x, int y, int count, lv_color_t color);
 
+// Idle animation functions
+static void updateIdleAnimation();
+static void startWander();
+static void updateWander();
+
 // Web server handlers for new features
 #if ENABLE_WEB_SERVER
 static void handleAlarms();
@@ -606,6 +618,9 @@ static void create_eye(Eye &e, int x, int y) {
   e.brow_pts[0] = {4, 2};
   e.brow_pts[1] = {EYE_W - 4, 6};
   lv_line_set_points(e.brow, e.brow_pts, 2);
+  
+  // Set initial brow color to match eye color
+  lv_obj_set_style_line_color(e.brow, COL_EYE[EMO_NORMAL], 0);
 
   lv_obj_move_foreground(e.pupil);
   lv_obj_move_foreground(e.glint);
@@ -835,29 +850,31 @@ static void emotionAudioNotification(Emotion e) {
   }
 }
 
+// REDUCED BLINK DURATIONS
 static uint16_t blinkDurationForEmotion(Emotion e) {
   switch(e) {
-    case EMO_SLEEPY:  return 260;
-    case EMO_SAD:     return 160;
-    case EMO_NORMAL:  return 120;
-    case EMO_CURIOUS: return 110;
-    case EMO_HAPPY:   return 105;
-    case EMO_EXCITED: return  90;
-    case EMO_ANGRY:   return  95;
-    default:          return 120;
+    case EMO_SLEEPY:  return 220;  // Reduced from 260
+    case EMO_SAD:     return 140;  // Reduced from 160
+    case EMO_NORMAL:  return 100;  // Reduced from 120
+    case EMO_CURIOUS: return 95;   // Reduced from 110
+    case EMO_HAPPY:   return 90;   // Reduced from 105
+    case EMO_EXCITED: return 80;   // Reduced from 90
+    case EMO_ANGRY:   return 85;   // Reduced from 95
+    default:          return 100;
   }
 }
 
+// REDUCED BLINK INTERVALS
 static uint32_t blinkIntervalForEmotion(Emotion e) {
   switch(e) {
-    case EMO_SLEEPY:  return 9000;
-    case EMO_SAD:     return 2600;
-    case EMO_NORMAL:  return 2000;
-    case EMO_CURIOUS: return 1500;
-    case EMO_HAPPY:   return 1200;
-    case EMO_EXCITED: return  700;
-    case EMO_ANGRY:   return  900;
-    default:          return 2000;
+    case EMO_SLEEPY:  return 7500;  // Reduced from 9000
+    case EMO_SAD:     return 2200;  // Reduced from 2600
+    case EMO_NORMAL:  return 1800;  // Reduced from 2000
+    case EMO_CURIOUS: return 1300;  // Reduced from 1500
+    case EMO_HAPPY:   return 1000;  // Reduced from 1200
+    case EMO_EXCITED: return 600;   // Reduced from 700
+    case EMO_ANGRY:   return 800;   // Reduced from 900
+    default:          return 1800;
   }
 }
 
@@ -886,6 +903,10 @@ static void set_emotion(Emotion emo, bool proofBlink) {
   lv_style_set_shadow_color(&style_eye, COL_EYE[emo]);
   lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
   lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  
+  // Update brow color to match eye color
+  lv_obj_set_style_line_color(eyeL.brow, COL_EYE[emo], 0);
+  lv_obj_set_style_line_color(eyeR.brow, COL_EYE[emo], 0);
   
   last_stable_emotion = emo;
   emotion_stable_since = millis();
@@ -971,331 +992,662 @@ static void loadConfig() {
 }
 
 static void handleRoot() {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<meta charset='UTF-8'>";
-  html += "<title>Emo Face Pro Configuration</title>";
-  html += "<style>";
-  html += "* { box-sizing: border-box; }";
-  html += "body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;}";
-  html += ".container{max-width:800px;margin:auto;background:rgba(255,255,255,0.95);padding:30px;border-radius:20px;box-shadow:0 10px 30px rgba(0,0,0,0.3);backdrop-filter:blur(10px);}";
-  html += "h1{color:#333;text-align:center;margin-bottom:30px;font-size:2.5em;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}";
-  html += "h2{color:#555;border-bottom:3px solid #667eea;padding-bottom:10px;margin-top:40px;font-size:1.8em;}";
-  html += ".form-group{margin:20px 0;padding:15px;background:rgba(255,255,255,0.7);border-radius:10px;transition:all 0.3s;}";
-  html += ".form-group:hover{background:rgba(255,255,255,0.9);transform:translateY(-2px);box-shadow:0 5px 15px rgba(0,0,0,0.1);}";
-  html += "label{display:block;margin-bottom:10px;font-weight:bold;color:#444;font-size:1.1em;}";
-  html += "input[type=text],input[type=password],input[type=number],select{width:100%;padding:12px;border:2px solid #ddd;border-radius:8px;font-size:16px;transition:border 0.3s;}";
-  html += "input:focus,select:focus{border-color:#667eea;outline:none;}";
-  html += "input[type=range]{width:100%;height:8px;border-radius:4px;background:#ddd;outline:none;opacity:0.7;transition:opacity 0.2s;}";
-  html += "input[type=range]:hover{opacity:1;}";
-  html += "input[type=range]::-webkit-slider-thumb{width:20px;height:20px;border-radius:50%;background:#667eea;cursor:pointer;}";
-  html += ".range-container{display:flex;align-items:center;gap:15px;}";
-  html += ".range-value{display:inline-block;min-width:40px;padding:5px 10px;background:#667eea;color:white;border-radius:5px;text-align:center;font-weight:bold;font-size:1.1em;}";
-  html += ".checkbox-group{display:flex;align-items:center;gap:10px;margin:15px 0;}";
-  html += ".checkbox-group input[type=checkbox]{width:20px;height:20px;}";
-  html += ".btn{display:inline-block;padding:15px 30px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;text-decoration:none;transition:all 0.3s;margin:10px 5px;}";
-  html += ".btn:hover{transform:translateY(-3px);box-shadow:0 10px 20px rgba(102,126,234,0.3);}";
-  html += ".section{margin:30px 0;padding:20px;background:linear-gradient(135deg,rgba(102,126,234,0.1) 0%,rgba(118,75,162,0.1) 100%);border-radius:15px;border-left:5px solid #667eea;}";
-  html += ".status{background:linear-gradient(135deg,#e8f5e8 0%,#d4edda 100%);padding:20px;border-radius:10px;margin:20px 0;border:2px solid #28a745;}";
-  html += ".status p{margin:10px 0;font-size:1.1em;}";
-  html += ".actions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}";
-  html += ".emoji-icon{font-size:1.5em;margin-right:10px;}";
-  html += ".alarm-status{background:linear-gradient(135deg,#fff3cd 0%,#ffeaa7 100%);padding:15px;border-radius:8px;margin:15px 0;border:2px solid #ffc107;}";
-  html += ".alarm-item{padding:10px;background:#f8f9fa;border-radius:5px;margin:5px 0;border-left:4px solid #667eea;}";
-  html += "@media (max-width:600px){.container{padding:15px;} h1{font-size:2em;} .actions-grid{grid-template-columns:1fr;}}";
-  html += "</style>";
-  html += "</head><body>";
-  html += "<div class='container'>";
-  html += "<h1>🤖 Emo Face Pro Configuration</h1>";
+  String html = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emo Face Pro - Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 1.1em;
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.2);
+        }
+
+        .card-title {
+            color: #667eea;
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #667eea;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title i {
+            font-size: 1.2em;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+
+        .status-item {
+            padding: 15px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .status-label {
+            font-size: 0.9em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+
+        .status-value {
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .status-good {
+            color: #4CAF50;
+        }
+
+        .status-warning {
+            color: #FF9800;
+        }
+
+        .status-error {
+            color: #f44336;
+        }
+
+        .control-group {
+            margin-bottom: 20px;
+        }
+
+        .control-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #444;
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .slider-value {
+            min-width: 50px;
+            padding: 5px 10px;
+            background: #667eea;
+            color: white;
+            border-radius: 5px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            height: 8px;
+            -webkit-appearance: none;
+            background: #ddd;
+            border-radius: 4px;
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 22px;
+            height: 22px;
+            background: #667eea;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: #5a6fd8;
+            transform: scale(1.1);
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 10px 0;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #4CAF50 0%, #2E7D32 100%);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 20px;
+        }
+
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+
+        .alarm-list {
+            max-height: 300px;
+            overflow-y: auto;
+            padding-right: 10px;
+        }
+
+        .alarm-item {
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .alarm-time {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .alarm-label {
+            color: #666;
+            margin: 5px 0;
+        }
+
+        .alarm-days {
+            display: flex;
+            gap: 5px;
+            margin-top: 5px;
+        }
+
+        .day {
+            width: 25px;
+            height: 25px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #e9ecef;
+            border-radius: 50%;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+
+        .day.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+
+        .form-control:focus {
+            border-color: #667eea;
+            outline: none;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            color: white;
+            opacity: 0.8;
+            font-size: 0.9em;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+            
+            .status-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Emo Face Pro Dashboard</h1>
+            <p>Version 2.1 | Real-time Emotion Control System</p>
+        </div>
+
+        <div class="dashboard">
+            <!-- System Status Card -->
+            <div class="card">
+                <h2 class="card-title">📊 System Status</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <div class="status-label">WiFi Status</div>
+                        <div class="status-value" id="wifiStatus">)=====";
   
-  // Status section
-  html += "<div class='section'>";
-  html += "<h2>📊 System Status</h2>";
-  html += "<div class='status'>";
-  html += "<p><strong>WiFi:</strong> ";
-  html += wifi_connected ? "✅ Connected (" + WiFi.SSID() + ")" : "❌ Disconnected";
-  html += "</p>";
-  html += "<p><strong>IP Address:</strong> ";
-  html += wifi_connected ? WiFi.localIP().toString() : (ap_mode ? WiFi.softAPIP().toString() : "N/A");
-  html += "</p>";
-  html += "<p><strong>Time:</strong> ";
-  html += time_synced ? "✅ Synchronized" : "❌ Not synchronized";
-  html += "</p>";
-  html += "<p><strong>Current Emotion:</strong> ";
-  html += String(current_emotion);
-  html += "</p>";
-  html += "<p><strong>Battery:</strong> ";
+  html += wifi_connected ? 
+          "<span class='status-good'>Connected</span>" : 
+          (ap_mode ? "<span class='status-warning'>AP Mode</span>" : "<span class='status-error'>Disconnected</span>");
+  
+  html += R"=====(</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">IP Address</div>
+                        <div class="status-value">)=====";
+  
+  html += wifi_connected ? WiFi.localIP().toString() : 
+          (ap_mode ? WiFi.softAPIP().toString() : "N/A");
+  
+  html += R"=====(</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Time Sync</div>
+                        <div class="status-value">)=====";
+  
+  html += time_synced ? 
+          "<span class='status-good'>Synchronized</span>" : 
+          "<span class='status-warning'>Not Synced</span>";
+  
+  html += R"=====(</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Current Emotion</div>
+                        <div class="status-value">)=====";
+  
+  const char* emotion_names[] = {"Normal", "Angry", "Happy", "Curious", "Sleepy", "Excited", "Sad"};
+  html += emotion_names[current_emotion];
+  
+  html += R"=====(</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Battery</div>
+                        <div class="status-value">)=====";
+  
   html += String(battery_level);
-  html += "%</p>";
-  html += "<p><strong>Brightness:</strong> ";
-  html += String(config.brightness);
-  html += "%</p>";
+  html += R"=====(%</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-label">Brightness</div>
+                        <div class="status-value">)=====";
   
-  // Alarm status
-  html += "<div class='alarm-status'>";
-  html += "<p><strong>Alarm Status:</strong> ";
-  html += alarm_triggered ? "🔔 Ringing" : "✅ Quiet";
-  html += "</p>";
-  html += "<p><strong>Next Alarm:</strong> ";
+  html += String(config.brightness);
+  html += R"=====(%</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Controls Card -->
+            <div class="card">
+                <h2 class="card-title">⚡ Quick Controls</h2>
+                <div class="btn-group">
+                    <a href="/test/emotion" class="btn btn-small">Test Emotions</a>
+                    <a href="/test/music" class="btn btn-small">Test Music</a>
+                    <a href="/test/brightness" class="btn btn-small">Test Brightness</a>
+                    <a href="/test/alarm" class="btn btn-small">Test Alarm</a>
+                    <a href="/calibrate" class="btn btn-small">Calibrate</a>
+                    <a href="/reboot" class="btn btn-small">Reboot</a>
+                </div>
+                
+                <div style="margin-top: 20px;">
+                    <h3 style="margin-bottom: 10px; color: #444;">Emotion Control</h3>
+                    <div class="btn-group">
+                        )=====";
+  
+  for (int i = 0; i < 7; i++) {
+    html += "<button onclick=\"setEmotion(" + String(i) + ")\" class=\"btn btn-small\" style=\"margin: 2px;\">" + 
+            String(emotion_names[i]) + "</button>";
+  }
+  
+  html += R"=====(
+                    </div>
+                </div>
+            </div>
+
+            <!-- Alarms Card -->
+            <div class="card">
+                <h2 class="card-title">⏰ Alarm System</h2>
+                <div class="status-item" style="margin-bottom: 15px;">
+                    <div class="status-label">Alarm Status</div>
+                    <div class="status-value">)=====";
+  
+  html += alarm_triggered ? 
+          "<span class='status-error'>Ringing</span>" : 
+          "<span class='status-good'>Quiet</span>";
+  
+  html += R"=====(</div>
+                </div>
+                
+                <div class="status-item" style="margin-bottom: 15px;">
+                    <div class="status-label">Next Alarm</div>
+                    <div class="status-value">)=====";
+  
   html += getNextAlarmTime();
-  html += "</p>";
-  html += "<p><strong>Active Alarms:</strong> ";
-  html += String(countActiveAlarms());
-  html += "</p>";
-  html += "</div>";
   
-  html += "</div>";
-  html += "</div>";
+  html += R"=====(</div>
+                </div>
+                
+                <div class="btn-group">
+                    <a href="/alarms" class="btn btn-small btn-success">Manage Alarms</a>
+                    <a href="/test/alarm" class="btn btn-small">Test Alarm</a>
+                </div>
+                
+                <div class="alarm-list" style="margin-top: 15px;">
+                    )=====";
   
-  html += "<form method='post' action='/save' onsubmit='return validateForm()'>";
-  
-  // WiFi Settings
-  html += "<div class='section'>";
-  html += "<h2>📶 WiFi Settings</h2>";
-  html += "<div class='form-group'>";
-  html += "<label for='wifi_ssid'>SSID:</label>";
-  html += "<input type='text' id='wifi_ssid' name='wifi_ssid' value='";
-  html += config.wifi_ssid;
-  html += "' required placeholder='Enter WiFi network name'>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label for='wifi_password'>Password:</label>";
-  html += "<input type='password' id='wifi_password' name='wifi_password' value='";
-  html += config.wifi_password;
-  html += "' placeholder='Enter WiFi password'>";
-  html += "</div>";
-  html += "</div>";
-  
-  // Display Settings
-  html += "<div class='section'>";
-  html += "<h2>💡 Display Settings</h2>";
-  html += "<div class='form-group'>";
-  html += "<label>Screen Brightness: <span class='range-value' id='brightnessValue'>";
-  html += String(config.brightness);
-  html += "%</span></label>";
-  html += "<input type='range' name='brightness' min='10' max='100' value='";
-  html += String(config.brightness);
-  html += "' oninput=\"brightnessValue.innerHTML=this.value+'%'\">";
-  html += "</div>";
-  html += "</div>";
-  
-  // Music Reaction Settings
-  html += "<div class='section'>";
-  html += "<h2>🎵 Music Reaction Settings</h2>";
-  html += "<div class='form-group'>";
-  html += "<label>Music Sensitivity: <span class='range-value' id='sensValue'>";
-  html += String(config.music_sensitivity);
-  html += "</span></label>";
-  html += "<div class='range-container'>";
-  html += "<span>Low</span><input type='range' name='music_sensitivity' min='1' max='10' value='";
-  html += String(config.music_sensitivity);
-  html += "' oninput=\"sensValue.innerHTML=this.value\"><span>High</span>";
-  html += "</div>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Microphone Gain: <span class='range-value' id='gainValue'>";
-  html += String(config.mic_gain, 1);
-  html += "</span></label>";
-  html += "<input type='range' name='mic_gain' min='0.1' max='2.0' step='0.1' value='";
-  html += String(config.mic_gain, 1);
-  html += "' oninput=\"gainValue.innerHTML=parseFloat(this.value).toFixed(1)\">";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Eyebrow Dance Speed: <span class='range-value' id='eyebrowValue'>";
-  html += String(config.eyebrow_dance_speed);
-  html += "</span></label>";
-  html += "<input type='range' name='eyebrow_speed' min='1' max='20' value='";
-  html += String(config.eyebrow_dance_speed);
-  html += "' oninput=\"eyebrowValue.innerHTML=this.value\">";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Eyeball Jump Strength: <span class='range-value' id='eyeballValue'>";
-  html += String(config.eyeball_jump_strength);
-  html += "</span></label>";
-  html += "<input type='range' name='eyeball_strength' min='1' max='20' value='";
-  html += String(config.eyeball_jump_strength);
-  html += "' oninput=\"eyeballValue.innerHTML=this.value\">";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Lip Sync Sensitivity: <span class='range-value' id='lipSyncValue'>";
-  html += String(config.lip_sync_sensitivity);
-  html += "</span></label>";
-  html += "<div class='range-container'>";
-  html += "<span>Low</span><input type='range' name='lip_sync_sensitivity' min='1' max='10' value='";
-  html += String(config.lip_sync_sensitivity);
-  html += "' oninput=\"lipSyncValue.innerHTML=this.value\"><span>High</span>";
-  html += "</div>";
-  html += "</div>";
-  html += "</div>";
-  
-  // Behavior Settings
-  html += "<div class='section'>";
-  html += "<h2>⚙️ Behavior Settings</h2>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='auto_emotion' name='auto_emotion' ";
-  html += config.auto_emotion ? "checked" : "";
-  html += ">";
-  html += "<label for='auto_emotion'>Auto Emotion Detection</label>";
-  html += "</div>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='voice_reactions' name='voice_reactions' ";
-  html += config.voice_reactions ? "checked" : "";
-  html += ">";
-  html += "<label for='voice_reactions'>Voice Reactions</label>";
-  html += "</div>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='music_reactions' name='music_reactions' ";
-  html += config.music_reactions ? "checked" : "";
-  html += ">";
-  html += "<label for='music_reactions'>Music Reactions</label>";
-  html += "</div>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='lip_sync_enabled' name='lip_sync_enabled' ";
-  html += config.lip_sync_enabled ? "checked" : "";
-  html += ">";
-  html += "<label for='lip_sync_enabled'>Lip Sync Animation</label>";
-  html += "</div>";
-  html += "<div class='checkbox-group'>";
-  html += "<input type='checkbox' id='notifications_enabled' name='notifications_enabled' ";
-  html += config.notifications_enabled ? "checked" : "";
-  html += ">";
-  html += "<label for='notifications_enabled'>Notifications</label>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label for='timezone'>Timezone:</label>";
-  html += "<select id='timezone' name='timezone'>";
-  html += "<option value='IST-5:30'";
-  if (config.timezone == "IST-5:30") html += " selected";
-  html += ">IST (India)</option>";
-  html += "<option value='EST+5:00'";
-  if (config.timezone == "EST+5:00") html += " selected";
-  html += ">EST (USA East)</option>";
-  html += "<option value='PST+8:00'";
-  if (config.timezone == "PST+8:00") html += " selected";
-  html += ">PST (USA West)</option>";
-  html += "<option value='GMT+0:00'";
-  if (config.timezone == "GMT+0:00") html += " selected";
-  html += ">GMT (London)</option>";
-  html += "<option value='CET-1:00'";
-  if (config.timezone == "CET-1:00") html += " selected";
-  html += ">CET (Europe)</option>";
-  html += "<option value='JST-9:00'";
-  if (config.timezone == "JST-9:00") html += " selected";
-  html += ">JST (Japan)</option>";
-  html += "</select>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label for='sleep_hour'>Sleep Time (24h format):</label>";
-  html += "<input type='number' id='sleep_hour' name='sleep_hour' min='0' max='23' value='";
-  html += String(config.sleep_hour);
-  html += "'>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label for='wake_hour'>Wake Time (24h format):</label>";
-  html += "<input type='number' id='wake_hour' name='wake_hour' min='0' max='23' value='";
-  html += String(config.wake_hour);
-  html += "'>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Alarm Volume: <span class='range-value' id='alarmVolValue'>";
-  html += String(config.alarm_volume);
-  html += "</span></label>";
-  html += "<div class='range-container'>";
-  html += "<span>Quiet</span><input type='range' name='alarm_volume' min='1' max='10' value='";
-  html += String(config.alarm_volume);
-  html += "' oninput=\"alarmVolValue.innerHTML=this.value\"><span>Loud</span>";
-  html += "</div>";
-  html += "</div>";
-  html += "</div>";
-  
-  html += "<div class='form-group' style='text-align:center;'>";
-  html += "<button type='submit' class='btn'>💾 Save All Settings</button>";
-  html += "</div>";
-  html += "</form>";
-  
-  // Actions section
-  html += "<div class='section'>";
-  html += "<h2>🚀 Quick Actions</h2>";
-  html += "<div class='actions-grid'>";
-  html += "<a href='/alarms' class='btn'><span class='emoji-icon'>⏰</span>Alarm Settings</a>";
-  html += "<a href='/calibrate' class='btn'><span class='emoji-icon'>🎯</span>Calibrate</a>";
-  html += "<a href='/reboot' class='btn'><span class='emoji-icon'>🔄</span>Reboot</a>";
-  html += "<a href='/wifi' class='btn'><span class='emoji-icon'>📶</span>Reconnect WiFi</a>";
-  html += "<a href='/test/music' class='btn'><span class='emoji-icon'>🎵</span>Test Music</a>";
-  html += "<a href='/test/emotion' class='btn'><span class='emoji-icon'>😊</span>Test Emotions</a>";
-  html += "<a href='/test/brightness' class='btn'><span class='emoji-icon'>💡</span>Test Brightness</a>";
-  html += "<a href='/test/alarm' class='btn'><span class='emoji-icon'>🔔</span>Test Alarm</a>";
-  html += "<a href='/factory_reset' class='btn' style='background:linear-gradient(135deg,#ff416c 0%,#ff4b2b 100%);'><span class='emoji-icon'>⚠️</span>Factory Reset</a>";
-  html += "</div>";
-  html += "</div>";
-  
-  // Active Alarms Display
-  html += "<div class='section'>";
-  html += "<h2>⏰ Active Alarms</h2>";
   int activeCount = 0;
   for (int i = 0; i < MAX_ALARMS; i++) {
     if (alarms[i].enabled) {
       activeCount++;
       html += "<div class='alarm-item'>";
-      html += "<strong>" + alarms[i].label + "</strong> - ";
+      html += "<div class='alarm-time'>";
       html += String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour);
       html += ":";
       html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
-      html += " ";
-      String days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      html += "</div>";
+      html += "<div class='alarm-label'>" + alarms[i].label + "</div>";
+      html += "<div class='alarm-days'>";
+      String days[] = {"S", "M", "T", "W", "T", "F", "S"};
       for (int d = 0; d < 7; d++) {
-        if (alarms[i].days[d]) html += days[d].substring(0, 1) + " ";
+        html += "<span class='day " + String(alarms[i].days[d] ? "active" : "") + "'>" + days[d] + "</span>";
       }
+      html += "</div>";
       html += "</div>";
     }
   }
+  
   if (activeCount == 0) {
-    html += "<p>No alarms set. <a href='/alarms'>Set alarms here</a></p>";
+    html += "<p style='text-align: center; color: #666; margin-top: 10px;'>No alarms set</p>";
   }
-  html += "</div>";
   
-  html += "<div style='text-align:center;margin-top:40px;color:#666;font-size:0.9em;'>";
-  html += "<p>Emo Face Pro v2.1 | ";
-  html += __DATE__;
-  html += " | ";
-  html += wifi_connected ? "Station Mode" : (ap_mode ? "AP Mode" : "Disconnected");
-  html += "</p>";
-  html += "</div>";
+  html += R"=====(
+                </div>
+            </div>
+
+            <!-- Settings Form Card -->
+            <div class="card">
+                <h2 class="card-title">⚙️ System Settings</h2>
+                <form method="post" action="/save" id="settingsForm">
+                    <div class="control-group">
+                        <label class="control-label">Display Brightness</label>
+                        <div class="slider-container">
+                            <input type="range" name="brightness" min="10" max="100" value=")=====";
   
-  html += "</div>";
+  html += String(config.brightness);
   
-  // JavaScript
-  html += "<script>";
-  html += "function validateForm() {";
-  html += "  var sleep = document.getElementById('sleep_hour').value;";
-  html += "  var wake = document.getElementById('wake_hour').value;";
-  html += "  if(sleep < 0 || sleep > 23 || wake < 0 || wake > 23) {";
-  html += "    alert('Sleep and wake hours must be between 0 and 23');";
-  html += "    return false;";
-  html += "  }";
-  html += "  if(parseInt(sleep) === parseInt(wake)) {";
-  html += "    alert('Sleep and wake times cannot be the same');";
-  html += "    return false;";
-  html += "  }";
-  html += "  return true;";
-  html += "}";
-  html += "document.addEventListener('DOMContentLoaded', function() {";
-  html += "  var sliders = document.querySelectorAll('input[type=range]');";
-  html += "  sliders.forEach(function(slider) {";
-  html += "    slider.addEventListener('input', function() {";
-  html += "      var valueDisplay = this.parentElement.querySelector('.range-value');";
-  html += "      if(valueDisplay) {";
-        html += "        if(this.name === 'brightness') {";
-  html += "          valueDisplay.innerHTML = this.value + '%';";
-  html += "        } else {";
-  html += "          valueDisplay.innerHTML = this.value;";
-  html += "        }";
-  html += "      }";
-  html += "    });";
-  html += "  });";
-  html += "});";
-  html += "</script>";
-  html += "</body></html>";
+  html += R"=====(" oninput="updateSlider('brightness', this.value)">
+                            <span class="slider-value" id="brightnessValue">)=====";
+  
+  html += String(config.brightness);
+  
+  html += R"=====(%</span>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label class="control-label">Music Sensitivity</label>
+                        <div class="slider-container">
+                            <input type="range" name="music_sensitivity" min="1" max="10" value=")=====";
+  
+  html += String(config.music_sensitivity);
+  
+  html += R"=====(" oninput="updateSlider('music_sensitivity', this.value)">
+                            <span class="slider-value" id="music_sensitivityValue">)=====";
+  
+  html += String(config.music_sensitivity);
+  
+  html += R"=====(</span>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label class="control-label">Microphone Gain</label>
+                        <div class="slider-container">
+                            <input type="range" name="mic_gain" min="0.1" max="2.0" step="0.1" value=")=====";
+  
+  html += String(config.mic_gain, 1);
+  
+  html += R"=====(" oninput="updateSlider('mic_gain', this.value)">
+                            <span class="slider-value" id="mic_gainValue">)=====";
+  
+  html += String(config.mic_gain, 1);
+  
+  html += R"=====(</span>
+                        </div>
+                    </div>
+
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="auto_emotion" name="auto_emotion" )=====";
+  
+  html += config.auto_emotion ? "checked" : "";
+  
+  html += R"=====(>
+                        <label for="auto_emotion">Auto Emotion Detection</label>
+                    </div>
+
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="music_reactions" name="music_reactions" )=====";
+  
+  html += config.music_reactions ? "checked" : "";
+  
+  html += R"=====(>
+                        <label for="music_reactions">Music Reactions</label>
+                    </div>
+
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="lip_sync_enabled" name="lip_sync_enabled" )=====";
+  
+  html += config.lip_sync_enabled ? "checked" : "";
+  
+  html += R"=====(>
+                        <label for="lip_sync_enabled">Lip Sync Animation</label>
+                    </div>
+
+                    <div class="btn-group" style="margin-top: 20px;">
+                        <button type="submit" class="btn btn-success">💾 Save Settings</button>
+                        <a href="/factory_reset" class="btn btn-danger">⚠️ Factory Reset</a>
+                    </div>
+                </form>
+            </div>
+
+            <!-- WiFi Settings Card -->
+            <div class="card">
+                <h2 class="card-title">📶 WiFi Configuration</h2>
+                <div class="control-group">
+                    <label class="control-label">WiFi SSID</label>
+                    <input type="text" name="wifi_ssid" class="form-control" value=")=====";
+  
+  html += config.wifi_ssid;
+  
+  html += R"=====(" placeholder="Enter WiFi network name">
+                </div>
+
+                <div class="control-group">
+                    <label class="control-label">WiFi Password</label>
+                    <input type="password" name="wifi_password" class="form-control" value=")=====";
+  
+  html += config.wifi_password;
+  
+  html += R"=====(" placeholder="Enter WiFi password">
+                </div>
+
+                <div class="control-group">
+                    <label class="control-label">Timezone</label>
+                    <select name="timezone" class="form-control">
+                        <option value="IST-5:30" )=====";
+  
+  if (config.timezone == "IST-5:30") html += "selected";
+  
+  html += R"=====(>IST (India)</option>
+                        <option value="EST+5:00" )=====";
+  
+  if (config.timezone == "EST+5:00") html += "selected";
+  
+  html += R"=====(>EST (USA East)</option>
+                        <option value="PST+8:00" )=====";
+  
+  if (config.timezone == "PST+8:00") html += "selected";
+  
+  html += R"=====(>PST (USA West)</option>
+                        <option value="GMT+0:00" )=====";
+  
+  if (config.timezone == "GMT+0:00") html += "selected";
+  
+  html += R"=====(>GMT (London)</option>
+                    </select>
+                </div>
+
+                <div class="btn-group" style="margin-top: 20px;">
+                    <a href="/wifi" class="btn">Reconnect WiFi</a>
+                    <a href="/" class="btn btn-small">Refresh Status</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>Emo Face Pro v2.1 | © 2024 | Hardware Accelerometer: X=Top/Bottom, Y=Left/Right, Z=Forward/Backward</p>
+        </div>
+    </div>
+
+    <script>
+        function updateSlider(id, value) {
+            const element = document.getElementById(id + 'Value');
+            if (element) {
+                if (id === 'brightness') {
+                    element.textContent = value + '%';
+                } else if (id === 'mic_gain') {
+                    element.textContent = parseFloat(value).toFixed(1);
+                } else {
+                    element.textContent = value;
+                }
+            }
+        }
+
+        function setEmotion(emotion) {
+            fetch('/setEmotion?emotion=' + emotion)
+                .then(response => response.text())
+                .then(data => {
+                    alert('Emotion set to: ' + ['Normal', 'Angry', 'Happy', 'Curious', 'Sleepy', 'Excited', 'Sad'][emotion]);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                });
+        }
+
+        // Update status every 10 seconds
+        setInterval(() => {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    // Update status indicators
+                    if (data.wifi) {
+                        document.getElementById('wifiStatus').innerHTML = 
+                            data.wifi_connected ? 
+                            '<span class="status-good">Connected</span>' : 
+                            '<span class="status-warning">Disconnected</span>';
+                    }
+                })
+                .catch(error => console.error('Status update failed:', error));
+        }, 10000);
+    </script>
+</body>
+</html>
+)=====";
   
   webServer.send(200, "text/html", html);
 }
@@ -1539,82 +1891,316 @@ static void handleFactoryReset() {
 }
 
 static void handleAlarms() {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<meta charset='UTF-8'>";
-  html += "<title>Alarm Settings - Emo Face Pro</title>";
-  html += "<style>";
-  html += "* { box-sizing: border-box; }";
-  html += "body{font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;}";
-  html += ".container{max-width:800px;margin:auto;background:rgba(255,255,255,0.95);padding:30px;border-radius:20px;box-shadow:0 10px 30px rgba(0,0,0,0.3);}";
-  html += "h1{color:#333;text-align:center;margin-bottom:30px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}";
-  html += ".alarm-card{background:linear-gradient(135deg,#f5f7fa 0%,#c3cfe2 100%);border-radius:15px;padding:20px;margin:15px 0;box-shadow:0 5px 15px rgba(0,0,0,0.1);}";
-  html += ".alarm-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;}";
-  html += ".alarm-time{font-size:2em;font-weight:bold;color:#333;}";
-  html += ".alarm-label{font-size:1.2em;color:#555;margin:10px 0;}";
-  html += ".day-selector{display:flex;gap:5px;margin:10px 0;}";
-  html += ".day-btn{padding:5px 10px;border-radius:5px;border:1px solid #ddd;cursor:pointer;background:#fff;}";
-  html += ".day-btn.active{background:#667eea;color:white;}";
-  html += ".btn{padding:10px 20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:8px;cursor:pointer;margin:5px;text-decoration:none;display:inline-block;}";
-  html += ".btn-danger{background:linear-gradient(135deg,#ff416c 0%,#ff4b2b 100%);}";
-  html += ".btn-success{background:linear-gradient(135deg,#4CAF50 0%,#2E7D32 100%);}";
-  html += ".form-group{margin:15px 0;}";
-  html += "input[type=time],input[type=text],select{padding:10px;border:2px solid #ddd;border-radius:5px;width:100%;}";
-  html += ".alarm-type{display:flex;gap:10px;margin:10px 0;}";
-  html += ".type-option{padding:10px;border:2px solid #ddd;border-radius:5px;cursor:pointer;background:#fff;}";
-  html += ".type-option.active{border-color:#667eea;background:#e8f0fe;}";
-  html += ".switch{position:relative;display:inline-block;width:60px;height=34px;}";
-  html += ".switch input{opacity:0;width:0;height:0;}";
-  html += ".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;transition:.4s;border-radius:34px;}";
-  html += ".slider:before{position:absolute;content:\"\";height:26px;width:26px;left:4px;bottom:4px;background-color:white;transition:.4s;border-radius:50%;}";
-  html += "input:checked + .slider{background-color:#667eea;}";
-  html += "input:checked + .slider:before{transform:translateX(26px);}";
-  html += "</style>";
-  html += "<script>";
-  html += "function toggleDay(btn, alarmIndex, dayIndex) {";
-  html += "  btn.classList.toggle('active');";
-  html += "  var daysInput = document.getElementById('days_' + alarmIndex);";
-  html += "  if(!daysInput) return;";
-  html += "  var days = daysInput.value.split(',').map(Number);";
-  html += "  days[dayIndex] = days[dayIndex] ? 0 : 1;";
-  html += "  daysInput.value = days.join(',');";
-  html += "}";
-  html += "function setAlarmType(type, alarmIndex) {";
-  html += "  document.querySelectorAll('#type_' + alarmIndex + ' .type-option').forEach(el => el.classList.remove('active'));";
-  html += "  event.target.classList.add('active');";
-  html += "  document.getElementById('type_input_' + alarmIndex).value = type;";
-  html += "}";
-  html += "function testAlarm() {";
-  html += "  fetch('/test/alarm');";
-  html += "  alert('Test alarm triggered! Check your device.');";
-  html += "}";
-  html += "function toggleAlarm(index, enabled) {";
-  html += "  document.getElementById('enabled_' + index).value = enabled ? '1' : '0';";
-  html += "}";
-  html += "function saveAlarm(index) {";
-  html += "  var form = document.getElementById('alarm_form_' + index);";
-  html += "  form.submit();";
-  html += "}";
-  html += "function deleteAlarm(index) {";
-  html += "  if(confirm('Delete this alarm?')) {";
-  html += "    window.location.href = '/delete_alarm?index=' + index;";
-  html += "  }";
-  html += "}";
-  html += "function addAlarm() {";
-  html += "  var time = document.getElementById('newAlarmTime').value;";
-  html += "  var label = document.getElementById('newAlarmLabel').value || 'New Alarm';";
-  html += "  if(!time) { alert('Please set a time'); return; }";
-  html += "  window.location.href = '/save_alarm?time=' + time + '&label=' + encodeURIComponent(label);";
-  html += "}";
-  html += "</script>";
-  html += "</head><body>";
-  html += "<div class='container'>";
-  html += "<h1>⏰ Alarm Settings</h1>";
-  
-  html += "<div style='text-align:center;margin-bottom:30px;'>";
-  html += "<a href='/' class='btn'>← Back to Main</a>";
-  html += "<button class='btn' onclick='testAlarm()'>🔔 Test Alarm</button>";
-  html += "</div>";
+  String html = R"=====(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alarm Settings - Emo Face Pro</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        .header h1 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 2.2em;
+            margin-bottom: 10px;
+        }
+
+        .back-btn {
+            display: inline-block;
+            margin-bottom: 20px;
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            transition: all 0.3s;
+        }
+
+        .back-btn:hover {
+            background: #5a6fd8;
+            transform: translateY(-2px);
+        }
+
+        .alarm-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+
+        .alarm-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .alarm-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .alarm-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #667eea;
+        }
+
+        .alarm-time {
+            font-size: 2.2em;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .alarm-label {
+            font-size: 1.3em;
+            color: #444;
+            margin-bottom: 15px;
+        }
+
+        .alarm-switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+
+        .alarm-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .alarm-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .alarm-slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .alarm-slider {
+            background-color: #667eea;
+        }
+
+        input:checked + .alarm-slider:before {
+            transform: translateX(26px);
+        }
+
+        .day-selector {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .day-btn {
+            width: 35px;
+            height: 35px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #e9ecef;
+            border-radius: 50%;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+
+        .day-btn.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .alarm-type-selector {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        .type-btn {
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+            background: #e9ecef;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+
+        .type-btn.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            margin-bottom: 15px;
+            transition: border-color 0.3s;
+        }
+
+        .form-control:focus {
+            border-color: #667eea;
+            outline: none;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #4CAF50 0%, #2E7D32 100%);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        .btn-small {
+            padding: 8px 16px;
+            font-size: 14px;
+        }
+
+        .new-alarm-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        .new-alarm-card h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            color: white;
+            opacity: 0.8;
+            font-size: 0.9em;
+        }
+
+        @media (max-width: 768px) {
+            .alarm-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .alarm-time {
+                font-size: 1.8em;
+            }
+            
+            .day-btn {
+                width: 30px;
+                height: 30px;
+                font-size: 0.9em;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⏰ Alarm Settings</h1>
+            <p>Manage your alarms and schedules</p>
+        </div>
+
+        <a href="/" class="back-btn">← Back to Dashboard</a>
+
+        <div class="btn-group" style="margin-bottom: 20px;">
+            <button onclick="testAlarm()" class="btn">🔔 Test Alarm</button>
+            <button onclick="stopAlarm()" class="btn btn-danger">🛑 Stop Alarm</button>
+        </div>
+
+        <div class="new-alarm-card">
+            <h2>Add New Alarm</h2>
+            <input type="time" id="newAlarmTime" class="form-control" required>
+            <input type="text" id="newAlarmLabel" class="form-control" placeholder="Alarm Label (e.g., Wake Up)">
+            <div class="btn-group">
+                <button onclick="addAlarm()" class="btn btn-success">➕ Add Alarm</button>
+            </div>
+        </div>
+
+        <div class="alarm-grid">
+            )=====";
   
   for (int i = 0; i < MAX_ALARMS; i++) {
     html += "<div class='alarm-card'>";
@@ -1624,32 +2210,27 @@ static void handleAlarms() {
     html += ":";
     html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
     html += "</div>";
-    html += "<label class='switch'>";
-    html += "<input type='checkbox' " + String(alarms[i].enabled ? "checked" : "") + " onchange='toggleAlarm(" + String(i) + ", this.checked)'>";
-    html += "<span class='slider'></span>";
+    html += "<label class='alarm-switch'>";
+    html += "<input type='checkbox' id='enabled_" + String(i) + "' ";
+    html += alarms[i].enabled ? "checked" : "";
+    html += " onchange='toggleAlarm(" + String(i) + ", this.checked)'>";
+    html += "<span class='alarm-slider'></span>";
     html += "</label>";
     html += "</div>";
     
-    html += "<form id='alarm_form_" + String(i) + "' method='post' action='/save_alarm'>";
-    html += "<input type='hidden' name='index' value='" + String(i) + "'>";
-    html += "<input type='hidden' id='enabled_" + String(i) + "' name='enabled' value='" + String(alarms[i].enabled ? "1" : "0") + "'>";
+    html += "<div class='alarm-label'>" + alarms[i].label + "</div>";
     
-    html += "<div class='form-group'>";
-    html += "<label>Time:</label>";
-    html += "<input type='time' name='time' value='";
+    html += "<form id='alarm_form_" + String(i) + "'>";
+    html += "<input type='hidden' name='index' value='" + String(i) + "'>";
+    
+    html += "<input type='time' name='time' class='form-control' value='";
     html += String(alarms[i].hour).length() == 1 ? "0" + String(alarms[i].hour) : String(alarms[i].hour);
     html += ":";
     html += String(alarms[i].minute).length() == 1 ? "0" + String(alarms[i].minute) : String(alarms[i].minute);
     html += "' required>";
-    html += "</div>";
     
-    html += "<div class='form-group'>";
-    html += "<label>Label:</label>";
-    html += "<input type='text' name='label' value='" + alarms[i].label + "' placeholder='Wake Up Alarm'>";
-    html += "</div>";
+    html += "<input type='text' name='label' class='form-control' value='" + alarms[i].label + "' placeholder='Alarm Label'>";
     
-    html += "<div class='form-group'>";
-    html += "<label>Repeat:</label>";
     html += "<div class='day-selector'>";
     String days[] = {"S", "M", "T", "W", "T", "F", "S"};
     String daysValue = "";
@@ -1660,44 +2241,131 @@ static void handleAlarms() {
     }
     html += "<input type='hidden' id='days_" + String(i) + "' name='days' value='" + daysValue + "'>";
     html += "</div>";
-    html += "</div>";
     
-    html += "<div class='form-group'>";
-    html += "<label>Alarm Type:</label>";
-    html += "<div class='alarm-type' id='type_" + String(i) + "'>";
-    html += "<div class='type-option " + String(alarms[i].type == 0 ? "active" : "") + "' onclick='setAlarmType(0, " + String(i) + ")'>Gentle</div>";
-    html += "<div class='type-option " + String(alarms[i].type == 1 ? "active" : "") + "' onclick='setAlarmType(1, " + String(i) + ")'>Standard</div>";
-    html += "<div class='type-option " + String(alarms[i].type == 2 ? "active" : "") + "' onclick='setAlarmType(2, " + String(i) + ")'>Energetic</div>";
+    html += "<div class='alarm-type-selector' id='type_" + String(i) + "'>";
+    html += "<div class='type-btn " + String(alarms[i].type == 0 ? "active" : "") + "' onclick='setAlarmType(0, " + String(i) + ")'>Gentle</div>";
+    html += "<div class='type-btn " + String(alarms[i].type == 1 ? "active" : "") + "' onclick='setAlarmType(1, " + String(i) + ")'>Standard</div>";
+    html += "<div class='type-btn " + String(alarms[i].type == 2 ? "active" : "") + "' onclick='setAlarmType(2, " + String(i) + ")'>Energetic</div>";
     html += "</div>";
     html += "<input type='hidden' id='type_input_" + String(i) + "' name='type' value='" + String(alarms[i].type) + "'>";
-    html += "</div>";
     
-    html += "<div style='text-align:center;'>";
-    html += "<button type='button' class='btn btn-success' onclick='saveAlarm(" + String(i) + ")'>💾 Save Alarm</button>";
-    html += "<button type='button' class='btn btn-danger' onclick='deleteAlarm(" + String(i) + ")'>🗑️ Delete</button>";
+    html += "<div class='btn-group'>";
+    html += "<button type='button' onclick='saveAlarm(" + String(i) + ")' class='btn btn-success btn-small'>💾 Save</button>";
+    html += "<button type='button' onclick='deleteAlarm(" + String(i) + ")' class='btn btn-danger btn-small'>🗑️ Delete</button>";
     html += "</div>";
     
     html += "</form>";
     html += "</div>";
   }
   
-  html += "<div class='alarm-card'>";
-  html += "<h3 style='text-align:center;'>Add New Alarm</h3>";
-  html += "<div class='form-group'>";
-  html += "<label>Time:</label>";
-  html += "<input type='time' id='newAlarmTime' required>";
-  html += "</div>";
-  html += "<div class='form-group'>";
-  html += "<label>Label:</label>";
-  html += "<input type='text' id='newAlarmLabel' placeholder='Wake Up Alarm'>";
-  html += "</div>";
-  html += "<div style='text-align:center;'>";
-  html += "<button type='button' class='btn' onclick='addAlarm()'>➕ Add Alarm</button>";
-  html += "</div>";
-  html += "</div>";
+  html += R"=====(
+        </div>
+
+        <div class="footer">
+            <p>Emo Face Pro Alarm System | Active Alarms: )=====";
   
-  html += "</div>";
-  html += "</body></html>";
+  html += String(countActiveAlarms());
+  html += R"=====( | Next Alarm: )=====";
+  html += getNextAlarmTime();
+  html += R"=====(</p>
+        </div>
+    </div>
+
+    <script>
+        function toggleDay(btn, alarmIndex, dayIndex) {
+            btn.classList.toggle('active');
+            const daysInput = document.getElementById('days_' + alarmIndex);
+            if (!daysInput) return;
+            const days = daysInput.value.split(',').map(Number);
+            days[dayIndex] = days[dayIndex] ? 0 : 1;
+            daysInput.value = days.join(',');
+        }
+
+        function setAlarmType(type, alarmIndex) {
+            const typeBtns = document.querySelectorAll('#type_' + alarmIndex + ' .type-btn');
+            typeBtns.forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('type_input_' + alarmIndex).value = type;
+        }
+
+        function toggleAlarm(index, enabled) {
+            fetch('/toggleAlarm?index=' + index + '&enabled=' + (enabled ? '1' : '0'));
+        }
+
+        function saveAlarm(index) {
+            const form = document.getElementById('alarm_form_' + index);
+            const formData = new FormData(form);
+            const params = new URLSearchParams();
+            
+            formData.forEach((value, key) => {
+                params.append(key, value);
+            });
+            
+            fetch('/saveAlarm?' + params.toString())
+                .then(() => {
+                    alert('Alarm saved successfully!');
+                    window.location.reload();
+                })
+                .catch(error => {
+                    alert('Error saving alarm: ' + error);
+                });
+        }
+
+        function deleteAlarm(index) {
+            if (confirm('Are you sure you want to delete this alarm?')) {
+                fetch('/deleteAlarm?index=' + index)
+                    .then(() => {
+                        alert('Alarm deleted!');
+                        window.location.reload();
+                    })
+                    .catch(error => {
+                        alert('Error deleting alarm: ' + error);
+                    });
+            }
+        }
+
+        function addAlarm() {
+            const time = document.getElementById('newAlarmTime').value;
+            const label = document.getElementById('newAlarmLabel').value || 'New Alarm';
+            
+            if (!time) {
+                alert('Please set a time for the alarm');
+                return;
+            }
+            
+            fetch('/addAlarm?time=' + time + '&label=' + encodeURIComponent(label))
+                .then(() => {
+                    alert('Alarm added successfully!');
+                    window.location.reload();
+                })
+                .catch(error => {
+                    alert('Error adding alarm: ' + error);
+                });
+        }
+
+        function testAlarm() {
+            fetch('/test/alarm');
+            alert('Test alarm triggered! Check your device.');
+        }
+
+        function stopAlarm() {
+            fetch('/stopAlarm');
+            alert('Alarm stopped (if ringing).');
+        }
+
+        // Initialize forms with current values
+        document.addEventListener('DOMContentLoaded', function() {
+            const timeInputs = document.querySelectorAll('input[type="time"]');
+            timeInputs.forEach(input => {
+                if (input.value === '0:00') {
+                    input.value = '07:00';
+                }
+            });
+        });
+    </script>
+</body>
+</html>
+)=====";
   
   webServer.send(200, "text/html", html);
 }
@@ -1837,8 +2505,29 @@ static void initWebServer() {
   webServer.on("/wifi", handleReconnectWiFi);
   webServer.on("/factory_reset", handleFactoryReset);
   webServer.on("/alarms", handleAlarms);
-  webServer.on("/save_alarm", handleSaveAlarm);
-  webServer.on("/delete_alarm", handleDeleteAlarm);
+  webServer.on("/saveAlarm", handleSaveAlarm);
+  webServer.on("/deleteAlarm", handleDeleteAlarm);
+  
+  webServer.on("/setEmotion", []() {
+    if (webServer.hasArg("emotion")) {
+      int emo = webServer.arg("emotion").toInt();
+      if (emo >= 0 && emo < EMO_COUNT) {
+        enhancedSetEmotion((Emotion)emo, true);
+        webServer.send(200, "text/plain", "Emotion set to " + String(emo));
+      }
+    }
+  });
+  
+  webServer.on("/status", []() {
+    String json = "{";
+    json += "\"wifi_connected\":" + String(wifi_connected ? "true" : "false") + ",";
+    json += "\"time_synced\":" + String(time_synced ? "true" : "false") + ",";
+    json += "\"current_emotion\":" + String(current_emotion) + ",";
+    json += "\"battery\":" + String(battery_level) + ",";
+    json += "\"brightness\":" + String(config.brightness);
+    json += "}";
+    webServer.send(200, "application/json", json);
+  });
   
   webServer.onNotFound([]() {
     String message = "File Not Found\n\n";
@@ -2295,19 +2984,22 @@ static int countActiveAlarms() {
 
 // ================== ENHANCED LIP ANIMATION ==================
 static void initLipAnimation() {
+  // Create 4-point lip shape with rounded corners
   mouth_top = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(mouth_top, 32, 6);
-  lv_obj_set_style_radius(mouth_top, 12, 0);
-  lv_obj_set_style_bg_color(mouth_top, lv_color_hex(0xD43F3F), 0);
+  lv_obj_set_size(mouth_top, 36, 8);
+  lv_obj_set_style_radius(mouth_top, 16, 0);
+  lv_obj_set_style_bg_color(mouth_top, lv_color_hex(0xFFFFFF), 0); // White color only
   lv_obj_set_style_bg_opa(mouth_top, LV_OPA_COVER, 0);
-  lv_obj_set_pos(mouth_top, (SCR_W-32)/2, 200);
+  lv_obj_set_style_border_width(mouth_top, 0, 0);
+  lv_obj_set_pos(mouth_top, (SCR_W-36)/2, 200);
   
   mouth_bottom = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(mouth_bottom, 32, 6);
-  lv_obj_set_style_radius(mouth_bottom, 12, 0);
-  lv_obj_set_style_bg_color(mouth_bottom, lv_color_hex(0xD43F3F), 0);
+  lv_obj_set_size(mouth_bottom, 36, 8);
+  lv_obj_set_style_radius(mouth_bottom, 16, 0);
+  lv_obj_set_style_bg_color(mouth_bottom, lv_color_hex(0xFFFFFF), 0); // White color only
   lv_obj_set_style_bg_opa(mouth_bottom, LV_OPA_COVER, 0);
-  lv_obj_set_pos(mouth_bottom, (SCR_W-32)/2, 206);
+  lv_obj_set_style_border_width(mouth_bottom, 0, 0);
+  lv_obj_set_pos(mouth_bottom, (SCR_W-36)/2, 208);
   
   lv_obj_move_foreground(mouth_top);
   lv_obj_move_foreground(mouth_bottom);
@@ -2342,7 +3034,7 @@ static void updateLipAnimation(float loudness, bool beat_detected) {
   float breath = sin(millis() * 0.002f) * 0.3f + 0.7f;
   float current_openness = lip_openness * breath;
   
-  int height = 3 + (int)(current_openness * 9);
+  int height = 4 + (int)(current_openness * 10);
   int separation = 2 + (int)((1.0f - current_openness) * 3);
   
   // Smooth animation using LVGL animations
@@ -2368,7 +3060,7 @@ static void updateLipAnimation(float loudness, bool beat_detected) {
   lv_anim_start(&anim_top);
   lv_anim_start(&anim_bottom);
   
-  int mouth_width = 28 + (int)(current_openness * 12);
+  int mouth_width = 30 + (int)(current_openness * 14);
   lv_obj_set_width(mouth_top, mouth_width);
   lv_obj_set_width(mouth_bottom, mouth_width);
   
@@ -2392,11 +3084,11 @@ static void lipSyncToMusic(float loudness, float bpm) {
   lip_transition_progress = 0.0f;
   
   int max_height = 12;
-  int min_height = 2;
+  int min_height = 4;
   int height = min_height + (int)(openness * (max_height - min_height));
   
-  int min_width = 24;
-  int max_width = 40;
+  int min_width = 28;
+  int max_width = 44;
   int width = min_width + (int)(openness * (max_width - min_width));
   
   int separation = 1 + (int)((1.0f - openness) * 3);
@@ -2430,12 +3122,6 @@ static void lipSyncToMusic(float loudness, float bpm) {
   lv_obj_set_x(mouth_top, (SCR_W - width)/2);
   lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
   lv_obj_set_y(mouth_bottom, 200 + height + separation);
-  
-  // Color intensity based on loudness
-  uint8_t color_intensity = 160 + (int)(openness * 95);
-  lv_color_t lip_color = lv_color_make(color_intensity, 40, 40);
-  lv_obj_set_style_bg_color(mouth_top, lip_color, 0);
-  lv_obj_set_style_bg_color(mouth_bottom, lip_color, 0);
 }
 
 static void setLipShapeForEmotion(Emotion e) {
@@ -2443,49 +3129,42 @@ static void setLipShapeForEmotion(Emotion e) {
   
   float target_openness;
   int width;
-  lv_color_t color = lv_color_hex(0xD43F3F);
   
   switch(e) {
     case EMO_HAPPY:
       target_openness = 0.8f;
-      width = 36;
-      color = lv_color_hex(0xFF3366);
+      width = 40;
       break;
     case EMO_SAD:
       target_openness = 0.3f;
-      width = 30;
-      color = lv_color_hex(0x9933CC);
+      width = 34;
       break;
     case EMO_EXCITED:
       target_openness = 0.9f;
-      width = 40;
-      color = lv_color_hex(0xFF6600);
+      width = 44;
       break;
     case EMO_ANGRY:
       target_openness = 0.4f;
-      width = 28;
-      color = lv_color_hex(0xFF0000);
+      width = 32;
       break;
     case EMO_SLEEPY:
       target_openness = 0.2f;
-      width = 24;
-      color = lv_color_hex(0x9966FF);
+      width = 28;
       break;
     case EMO_CURIOUS:
       target_openness = 0.5f;
-      width = 26;
-      color = lv_color_hex(0x33CCCC);
+      width = 30;
       break;
     default:
       target_openness = 0.5f;
-      width = 32;
+      width = 36;
       break;
   }
   
   target_lip_openness = target_openness;
   lip_transition_progress = 0.0f;
   
-  int height = 3 + (int)(target_openness * 9);
+  int height = 4 + (int)(target_openness * 10);
   int separation = 2 + (int)((1.0f - target_openness) * 3);
   
   lv_anim_t anim;
@@ -2512,9 +3191,6 @@ static void setLipShapeForEmotion(Emotion e) {
   lv_obj_set_x(mouth_top, (SCR_W - width)/2);
   lv_obj_set_x(mouth_bottom, (SCR_W - width)/2);
   lv_obj_set_y(mouth_bottom, 200 + height + separation);
-  
-  lv_obj_set_style_bg_color(mouth_top, color, 0);
-  lv_obj_set_style_bg_color(mouth_bottom, color, 0);
 }
 
 // ================== PARTICLE SYSTEM ==================
@@ -2575,6 +3251,68 @@ static void spawnParticles(int x, int y, int count, lv_color_t color) {
   }
 }
 
+// ================== IDLE ANIMATION ==================
+static void updateIdleAnimation() {
+  uint32_t now = millis();
+  
+  if (now - last_idle_update < 50) return; // Update every 50ms
+  last_idle_update = now;
+  
+  // Check if we should start wandering
+  if (!is_wandering && now > next_wander_time) {
+    startWander();
+  }
+  
+  // Update wander if active
+  if (is_wandering) {
+    updateWander();
+  }
+}
+
+static void startWander() {
+  if (current_loudness > 0.1f || config.music_reactions) return; // Don't wander during music
+  
+  wander_target_x = random(-15, 16);
+  wander_target_y = random(-10, 11);
+  is_wandering = true;
+  
+  // Set wander duration (2-5 seconds)
+  next_wander_time = millis() + random(2000, 5000);
+}
+
+static void updateWander() {
+  // Move pupils towards target
+  int dx = wander_target_x;
+  int dy = wander_target_y;
+  
+  eyeL.setTarget(dx, dy);
+  eyeR.setTarget(dx, dy);
+  
+  // Move eyebrows in same direction (scaled)
+  int eyebrow_tilt = -dy * 0.8f; // Invert for natural look
+  set_brow_line(eyeL, eyebrow_tilt);
+  set_brow_line(eyeR, eyebrow_tilt);
+  
+  // Move lips slightly in same direction
+  if (mouth_top && mouth_bottom) {
+    int lip_offset_x = dx * 0.3f;
+    int current_x = lv_obj_get_x(mouth_top);
+    int target_x = (SCR_W - lv_obj_get_width(mouth_top))/2 + lip_offset_x;
+    
+    if (abs(current_x - target_x) > 1) {
+      int new_x = current_x + (target_x > current_x ? 1 : -1);
+      lv_obj_set_x(mouth_top, new_x);
+      lv_obj_set_x(mouth_bottom, new_x);
+    }
+  }
+  
+  // Check if we've reached target
+  if (abs(eyeL.pupil_dx - wander_target_x) < 2 && 
+      abs(eyeL.pupil_dy - wander_target_y) < 2) {
+    is_wandering = false;
+  }
+}
+
 // Music reaction functions
 static void updateEyebrowDance(float loudness, float beat_bpm) {
   static uint32_t last_eyebrow_update = 0;
@@ -2607,18 +3345,11 @@ static void updateEyebrowDance(float loudness, float beat_bpm) {
     lv_obj_set_style_line_width(eyeR.brow, line_width, 0);
     
   } else {
-    static Emotion last_emotion = EMO_NORMAL;
-    if (current_emotion != last_emotion) {
-      switch(current_emotion) {
-        case EMO_ANGRY:   set_brow_line(eyeL, 6);  set_brow_line(eyeR, -6); break;
-        case EMO_HAPPY:   set_brow_line(eyeL, -4); set_brow_line(eyeR, 4);  break;
-        case EMO_SAD:     set_brow_line(eyeL, 3);  set_brow_line(eyeR, -3); break;
-        case EMO_SLEEPY:  set_brow_line(eyeL, 1);  set_brow_line(eyeR, -1); break;
-        case EMO_EXCITED: set_brow_line(eyeL, -5); set_brow_line(eyeR, 5);  break;
-        case EMO_CURIOUS: set_brow_line(eyeL, 4);  set_brow_line(eyeR, 4);  break;
-        default:          set_brow_line(eyeL, 0);  set_brow_line(eyeR, 0);  break;
-      }
-      last_emotion = current_emotion;
+    // During idle, brows follow pupil movement
+    if (is_wandering) {
+      int eyebrow_tilt = -eyeL.pupil_dy * 0.5f;
+      set_brow_line(eyeL, eyebrow_tilt);
+      set_brow_line(eyeR, eyebrow_tilt);
     }
   }
 }
@@ -2811,7 +3542,7 @@ static void enhancedBlink() {
   } else {
     switch(current_emotion) {
       case EMO_SLEEPY:
-        blink_speed = 300;
+        blink_speed = 220;
         break;
       case EMO_EXCITED:
         blink_speed = 80;
@@ -2821,16 +3552,16 @@ static void enhancedBlink() {
         }
         break;
       case EMO_SAD:
-        blink_speed = 180;
+        blink_speed = 140;
         break;
       case EMO_HAPPY:
-        blink_speed = 100;
-        break;
-      case EMO_ANGRY:
         blink_speed = 90;
         break;
+      case EMO_ANGRY:
+        blink_speed = 85;
+        break;
       default:
-        blink_speed = 120;
+        blink_speed = 100;
         break;
     }
   }
@@ -2858,6 +3589,10 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
   lv_style_set_shadow_color(&style_eye, COL_EYE[emo]);
   lv_obj_refresh_style(eyeL.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
   lv_obj_refresh_style(eyeR.eye, LV_PART_MAIN, LV_STYLE_PROP_ANY);
+  
+  // Update brow color to match eye color
+  lv_obj_set_style_line_color(eyeL.brow, COL_EYE[emo], 0);
+  lv_obj_set_style_line_color(eyeR.brow, COL_EYE[emo], 0);
   
   #if ENABLE_MOOD_MEMORY
   float intensity = 1.0f;
@@ -3390,7 +4125,7 @@ void setup() {
   
   Serial.println("======================================");
   Serial.println("Emo Face Pro v2.1 Ready!");
-  Serial.println("Features: Improved Audio Notifications, Continuous Alarms");
+  Serial.println("Features: Improved Web UI, Color-synced Eyebrows, White Lips, Idle Wandering");
   Serial.println("Accelerometer: X=Top/Bottom, Y=Left/Right, Z=Forward/Backward");
   Serial.println("Serial Commands:");
   Serial.println("  0-6: Change emotion");
@@ -3433,6 +4168,7 @@ void loop() {
     
     updateLipTransition();
     updateParticles(current_emotion);
+    updateIdleAnimation();
   }
 
   #if ENABLE_WEB_SERVER
