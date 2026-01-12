@@ -23,7 +23,6 @@
 #include <math.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <time.h>
 #include <esp_sntp.h>
 #include <esp_wifi.h>
@@ -93,7 +92,6 @@ String ap_password = "12345678";
 
 // ================== Alarm System Config =================
 #define MAX_ALARMS 5
-#define ALARM_RING_DURATION 30000  // 30 seconds of continuous ringing
 #define ALARM_SNOOZE_DURATION 300000  // 5 minutes snooze
 
 // ================== Hardware Pins =================
@@ -129,6 +127,13 @@ static struct {
   int lip_sync_sensitivity = 5;
   bool notifications_enabled = true;
   int alarm_volume = 7;
+  int alarm_duration = 30;  // Duration in seconds
+  
+  // Manual time settings
+  int manual_hour = 12;
+  int manual_minute = 0;
+  int manual_second = 0;
+  bool use_manual_time = false;
 } config;
 
 static const long  GMT_OFFSET_SEC = 5.5 * 3600;
@@ -415,9 +420,10 @@ static float hpf_prev_in  = 0.0f;
 static float hpf_prev_out = 0.0f;
 
 #if ENABLE_WIFI
-static WiFiMulti wifiMulti;
 static uint32_t wifi_last_attempt = 0;
 static bool wifi_connecting = false;
+static String last_ssid = "";
+static String last_password = "";
 #endif
 
 static lv_obj_t *time_label = nullptr;
@@ -464,6 +470,69 @@ static size_t tts_text_pos = 0;
 static uint32_t tts_next_char_time = 0;
 #endif
 
+// ================== MMA8452Q DRIVER ==================
+namespace MMA8452Q {
+  uint8_t addr = 0x1D;
+  const uint8_t REG_WHOAMI    = 0x0D;
+  const uint8_t REG_CTRL1     = 0x2A;
+  const uint8_t REG_XYZ_CFG   = 0x0E;
+  const uint8_t REG_OUT_X_MSB = 0x01;
+
+  bool present = false;
+
+  uint8_t read8(uint8_t reg) {
+    Wire.beginTransmission(addr); 
+    Wire.write(reg); 
+    Wire.endTransmission(false);
+    Wire.requestFrom((int)addr, 1);
+    return Wire.available() ? Wire.read() : 0xFF;
+  }
+  
+  void write8(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(addr); 
+    Wire.write(reg); 
+    Wire.write(val); 
+    Wire.endTransmission();
+  }
+
+  bool init() {
+    for (uint8_t a : { (uint8_t)0x1D, (uint8_t)0x1C }) {
+      addr = a;
+      uint8_t who = read8(REG_WHOAMI);
+      if (who == 0x2A) { 
+        present = true; 
+        break; 
+      }
+    }
+    if (!present) return false;
+
+    uint8_t c1 = read8(REG_CTRL1);
+    write8(REG_CTRL1, c1 & ~0x01);
+    write8(REG_XYZ_CFG, 0x00);
+    write8(REG_CTRL1, (c1 & ~(0b111 << 3)) | (0b010 << 3) | 0x01);
+    return true;
+  }
+
+  bool read(float &ax_g, float &ay_g, float &az_g) {
+    ax_g=ay_g=az_g=0;
+    if (!present) return false;
+    Wire.beginTransmission(addr); 
+    Wire.write(REG_OUT_X_MSB); 
+    Wire.endTransmission(false);
+    Wire.requestFrom((int)addr, 6);
+    if (Wire.available() < 6) return false;
+
+    int16_t x = (Wire.read()<<8) | Wire.read();
+    int16_t y = (Wire.read()<<8) | Wire.read();
+    int16_t z = (Wire.read()<<8) | Wire.read();
+
+    x >>= 2; y >>= 2; z >>= 2;
+    const float SCALE = 1.0f / 4096.0f;
+    ax_g = x * SCALE; ay_g = y * SCALE; az_g = z * SCALE;
+    return true;
+  }
+}
+
 // ================== FORWARD DECLARATIONS ==================
 static void playTone(float freq, int ms, float vol = 0.35f);
 static void playMelody(const float* notes, const int* durations, int count, float vol = 0.35f);
@@ -475,11 +544,13 @@ static void calibrateAccelerometerZero();
 static void calibrateBlinkOffset();
 static void autoCalibrateBlink();
 static void initTime();
+static void setManualTime(int hour, int minute, int second);
 
 // Time functions
 #if ENABLE_TIME_FEATURES
 static int getCurrentHour();
 static int getCurrentMinute();
+static int getCurrentSecond();
 static String getCurrentTimeString();
 #endif
 
@@ -536,7 +607,48 @@ static void handleAlarms();
 static void handleSaveAlarm();
 static void handleDeleteAlarm();
 static void handleTestAlarm();
+static void handleSetManualTime();
 #endif
+
+// WiFi functions
+static void reconnectWiFi();
+
+// NEW: WiFi interference reduction function
+static void reduceWiFiInterference(bool reduce) {
+  #if ENABLE_WIFI
+  if (reduce) {
+    // Reduce WiFi power and disable during I2C reads
+    esp_wifi_set_max_tx_power(8); // Lower TX power (8 = 2dBm)
+    WiFi.setSleep(true);
+    // Add a small delay to let WiFi settle
+    delayMicroseconds(50);
+  } else {
+    // Restore WiFi settings
+    esp_wifi_set_max_tx_power(20); // Normal TX power (20 = 20dBm)
+    WiFi.setSleep(false);
+  }
+  #endif
+}
+
+// NEW: Enhanced I2C communication with retry logic
+static bool readAccelerometer(float &ax, float &ay, float &az) {
+  if (!MMA8452Q::present) return false;
+  
+  // Disable WiFi during I2C read to prevent interference
+  reduceWiFiInterference(true);
+  
+  bool success = false;
+  for (int retry = 0; retry < 3; retry++) {
+    success = MMA8452Q::read(ax, ay, az);
+    if (success) break;
+    delayMicroseconds(100); // Small delay between retries
+  }
+  
+  // Re-enable WiFi
+  reduceWiFiInterference(false);
+  
+  return success;
+}
 
 static inline void set_top_lid(void *obj, int32_t v) {
   lv_obj_t *o = (lv_obj_t*)obj;
@@ -956,6 +1068,13 @@ static void saveConfig() {
   preferences.putInt("lip_sens", config.lip_sync_sensitivity);
   preferences.putBool("notifications", config.notifications_enabled);
   preferences.putInt("alarm_vol", config.alarm_volume);
+  preferences.putInt("alarm_duration", config.alarm_duration);
+  
+  // Manual time settings
+  preferences.putInt("manual_hour", config.manual_hour);
+  preferences.putInt("manual_minute", config.manual_minute);
+  preferences.putInt("manual_second", config.manual_second);
+  preferences.putBool("use_manual_time", config.use_manual_time);
   
   preferences.end();
   
@@ -983,12 +1102,53 @@ static void loadConfig() {
   config.lip_sync_sensitivity = preferences.getInt("lip_sens", 5);
   config.notifications_enabled = preferences.getBool("notifications", true);
   config.alarm_volume = preferences.getInt("alarm_vol", 7);
+  config.alarm_duration = preferences.getInt("alarm_duration", 30);
+  
+  // Manual time settings
+  config.manual_hour = preferences.getInt("manual_hour", 12);
+  config.manual_minute = preferences.getInt("manual_minute", 0);
+  config.manual_second = preferences.getInt("manual_second", 0);
+  config.use_manual_time = preferences.getBool("use_manual_time", false);
   
   preferences.end();
   
   SLEEP_HOUR = config.sleep_hour;
   WAKE_HOUR = config.wake_hour;
   updateBrightness();
+}
+
+static void setManualTime(int hour, int minute, int second) {
+  struct timeval tv;
+  struct tm timeinfo;
+  
+  // Get current time
+  gettimeofday(&tv, NULL);
+  localtime_r(&tv.tv_sec, &timeinfo);
+  
+  // Set new time
+  timeinfo.tm_hour = hour;
+  timeinfo.tm_min = minute;
+  timeinfo.tm_sec = second;
+  
+  // Convert back to time_t
+  time_t new_time = mktime(&timeinfo);
+  
+  // Set system time
+  tv.tv_sec = new_time;
+  tv.tv_usec = 0;
+  settimeofday(&tv, NULL);
+  
+  Serial.printf("Manual time set to: %02d:%02d:%02d\n", hour, minute, second);
+  
+  // Update config
+  config.manual_hour = hour;
+  config.manual_minute = minute;
+  config.manual_second = second;
+  config.use_manual_time = true;
+  saveConfig();
+  
+  // Update display
+  updateTimeDisplay();
 }
 
 static void handleRoot() {
@@ -1282,6 +1442,27 @@ static void handleRoot() {
             outline: none;
         }
 
+        .time-input-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .time-input {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            text-align: center;
+        }
+
+        .time-separator {
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #667eea;
+        }
+
         .footer {
             text-align: center;
             margin-top: 40px;
@@ -1301,6 +1482,14 @@ static void handleRoot() {
             
             .header h1 {
                 font-size: 2em;
+            }
+            
+            .time-input-group {
+                flex-direction: column;
+            }
+            
+            .time-separator {
+                display: none;
             }
         }
     </style>
@@ -1340,7 +1529,7 @@ static void handleRoot() {
                         <div class="status-label">Time Sync</div>
                         <div class="status-value">)=====";
   
-  html += time_synced ? 
+  html += time_synced || config.use_manual_time ? 
           "<span class='status-good'>Synchronized</span>" : 
           "<span class='status-warning'>Not Synced</span>";
   
@@ -1496,6 +1685,22 @@ static void handleRoot() {
                     </div>
 
                     <div class="control-group">
+                        <label class="control-label">Alarm Duration (seconds)</label>
+                        <div class="slider-container">
+                            <input type="range" name="alarm_duration" min="10" max="120" step="5" value=")=====";
+  
+  html += String(config.alarm_duration);
+  
+  html += R"=====(" oninput="updateSlider('alarm_duration', this.value)">
+                            <span class="slider-value" id="alarm_durationValue">)=====";
+  
+  html += String(config.alarm_duration);
+  
+  html += R"=====(s</span>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
                         <label class="control-label">Microphone Gain</label>
                         <div class="slider-container">
                             <input type="range" name="mic_gain" min="0.1" max="2.0" step="0.1" value=")=====";
@@ -1548,53 +1753,98 @@ static void handleRoot() {
             <!-- WiFi Settings Card -->
             <div class="card">
                 <h2 class="card-title">📶 WiFi Configuration</h2>
-                <div class="control-group">
-                    <label class="control-label">WiFi SSID</label>
-                    <input type="text" name="wifi_ssid" class="form-control" value=")=====";
+                <form method="post" action="/save" id="wifiForm">
+                    <div class="control-group">
+                        <label class="control-label">WiFi SSID</label>
+                        <input type="text" name="wifi_ssid" class="form-control" value=")=====";
   
   html += config.wifi_ssid;
   
-  html += R"=====(" placeholder="Enter WiFi network name">
-                </div>
+  html += R"=====(" placeholder="Enter WiFi network name" required>
+                    </div>
 
-                <div class="control-group">
-                    <label class="control-label">WiFi Password</label>
-                    <input type="password" name="wifi_password" class="form-control" value=")=====";
+                    <div class="control-group">
+                        <label class="control-label">WiFi Password</label>
+                        <input type="password" name="wifi_password" class="form-control" value=")=====";
   
   html += config.wifi_password;
   
   html += R"=====(" placeholder="Enter WiFi password">
-                </div>
+                    </div>
 
-                <div class="control-group">
-                    <label class="control-label">Timezone</label>
-                    <select name="timezone" class="form-control">
-                        <option value="IST-5:30" )=====";
+                    <div class="control-group">
+                        <label class="control-label">Timezone</label>
+                        <select name="timezone" class="form-control">
+                            <option value="IST-5:30" )=====";
   
   if (config.timezone == "IST-5:30") html += "selected";
   
   html += R"=====(>IST (India)</option>
-                        <option value="EST+5:00" )=====";
+                            <option value="EST+5:00" )=====";
   
   if (config.timezone == "EST+5:00") html += "selected";
   
   html += R"=====(>EST (USA East)</option>
-                        <option value="PST+8:00" )=====";
+                            <option value="PST+8:00" )=====";
   
   if (config.timezone == "PST+8:00") html += "selected";
   
   html += R"=====(>PST (USA West)</option>
-                        <option value="GMT+0:00" )=====";
+                            <option value="GMT+0:00" )=====";
   
   if (config.timezone == "GMT+0:00") html += "selected";
   
   html += R"=====(>GMT (London)</option>
-                    </select>
+                        </select>
+                    </div>
+
+                    <div class="btn-group" style="margin-top: 20px;">
+                        <button type="submit" class="btn btn-success">💾 Save WiFi Settings</button>
+                        <a href="/wifi" class="btn">Reconnect WiFi</a>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Manual Time Settings Card -->
+            <div class="card">
+                <h2 class="card-title">⏱️ Manual Time Setting</h2>
+                <div class="control-group">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="use_manual_time" name="use_manual_time" )=====";
+  
+  html += config.use_manual_time ? "checked" : "";
+  
+  html += R"=====(>
+                        <label for="use_manual_time">Use Manual Time (Disables NTP)</label>
+                    </div>
                 </div>
 
-                <div class="btn-group" style="margin-top: 20px;">
-                    <a href="/wifi" class="btn">Reconnect WiFi</a>
-                    <a href="/" class="btn btn-small">Refresh Status</a>
+                <div class="control-group">
+                    <label class="control-label">Current Time</label>
+                    <div class="time-input-group">
+                        <input type="number" id="manual_hour" class="time-input" min="0" max="23" value=")=====";
+  
+  html += String(config.manual_hour);
+  
+  html += R"=====(" placeholder="HH">
+                        <span class="time-separator">:</span>
+                        <input type="number" id="manual_minute" class="time-input" min="0" max="59" value=")=====";
+  
+  html += String(config.manual_minute);
+  
+  html += R"=====(" placeholder="MM">
+                        <span class="time-separator">:</span>
+                        <input type="number" id="manual_second" class="time-input" min="0" max="59" value=")=====";
+  
+  html += String(config.manual_second);
+  
+  html += R"=====(" placeholder="SS">
+                    </div>
+                </div>
+
+                <div class="btn-group">
+                    <button onclick="setManualTime()" class="btn btn-success">🕐 Set Manual Time</button>
+                    <button onclick="syncWithSystem()" class="btn">🔄 Sync with System</button>
                 </div>
             </div>
         </div>
@@ -1612,6 +1862,8 @@ static void handleRoot() {
                     element.textContent = value + '%';
                 } else if (id === 'mic_gain') {
                     element.textContent = parseFloat(value).toFixed(1);
+                } else if (id === 'alarm_duration') {
+                    element.textContent = value + 's';
                 } else {
                     element.textContent = value;
                 }
@@ -1629,6 +1881,37 @@ static void handleRoot() {
                 });
         }
 
+        function setManualTime() {
+            const hour = document.getElementById('manual_hour').value;
+            const minute = document.getElementById('manual_minute').value;
+            const second = document.getElementById('manual_second').value;
+            const useManualTime = document.getElementById('use_manual_time').checked;
+            
+            const params = new URLSearchParams();
+            params.append('hour', hour);
+            params.append('minute', minute);
+            params.append('second', second);
+            params.append('use_manual_time', useManualTime ? '1' : '0');
+            
+            fetch('/setManualTime?' + params.toString())
+                .then(response => response.text())
+                .then(data => {
+                    alert('Time set successfully!');
+                    window.location.reload();
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Failed to set time: ' + error);
+                });
+        }
+
+        function syncWithSystem() {
+            const now = new Date();
+            document.getElementById('manual_hour').value = now.getHours();
+            document.getElementById('manual_minute').value = now.getMinutes();
+            document.getElementById('manual_second').value = now.getSeconds();
+        }
+
         // Update status every 10 seconds
         setInterval(() => {
             fetch('/status')
@@ -1644,6 +1927,47 @@ static void handleRoot() {
                 })
                 .catch(error => console.error('Status update failed:', error));
         }, 10000);
+
+        // Form submission handlers
+        document.getElementById('settingsForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            
+            fetch('/save', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.text())
+            .then(data => {
+                alert('Settings saved successfully!');
+                window.location.reload();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Failed to save settings: ' + error);
+            });
+        });
+
+        document.getElementById('wifiForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            
+            fetch('/save', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.text())
+            .then(data => {
+                alert('WiFi settings saved! Device will reconnect.');
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Failed to save WiFi settings: ' + error);
+            });
+        });
     </script>
 </body>
 </html>
@@ -1654,6 +1978,10 @@ static void handleRoot() {
 
 static void handleSave() {
   if (webServer.method() == HTTP_POST) {
+    String old_ssid = config.wifi_ssid;
+    String old_password = config.wifi_password;
+    bool wifi_changed = false;
+    
     for (int i = 0; i < webServer.args(); i++) {
       String name = webServer.argName(i);
       String value = webServer.arg(i);
@@ -1668,14 +1996,18 @@ static void handleSave() {
         config.eyeball_jump_strength = value.toInt();
       } else if (name == "wifi_ssid") {
         config.wifi_ssid = value;
+        if (config.wifi_ssid != old_ssid) wifi_changed = true;
       } else if (name == "wifi_password") {
         config.wifi_password = value;
+        if (config.wifi_password != old_password) wifi_changed = true;
       } else if (name == "timezone") {
         config.timezone = value;
       } else if (name == "sleep_hour") {
         config.sleep_hour = value.toInt();
+        SLEEP_HOUR = config.sleep_hour;
       } else if (name == "wake_hour") {
         config.wake_hour = value.toInt();
+        WAKE_HOUR = config.wake_hour;
       } else if (name == "brightness") {
         config.brightness = value.toInt();
         updateBrightness();
@@ -1683,6 +2015,8 @@ static void handleSave() {
         config.lip_sync_sensitivity = value.toInt();
       } else if (name == "alarm_volume") {
         config.alarm_volume = value.toInt();
+      } else if (name == "alarm_duration") {
+        config.alarm_duration = value.toInt();
       } else if (name == "auto_emotion") {
         config.auto_emotion = true;
       } else if (name == "voice_reactions") {
@@ -1693,6 +2027,8 @@ static void handleSave() {
         config.lip_sync_enabled = true;
       } else if (name == "notifications_enabled") {
         config.notifications_enabled = true;
+      } else if (name == "use_manual_time") {
+        config.use_manual_time = true;
       }
     }
     
@@ -1701,6 +2037,7 @@ static void handleSave() {
     if (!webServer.hasArg("music_reactions")) config.music_reactions = false;
     if (!webServer.hasArg("lip_sync_enabled")) config.lip_sync_enabled = false;
     if (!webServer.hasArg("notifications_enabled")) config.notifications_enabled = false;
+    if (!webServer.hasArg("use_manual_time")) config.use_manual_time = false;
     
     saveConfig();
     
@@ -1708,15 +2045,42 @@ static void handleSave() {
     html += "<div style='max-width:500px;margin:auto;background:#f0f0f0;padding:30px;border-radius:10px;'>";
     html += "<h1 style='color:#4CAF50;'>✅ Settings Saved!</h1>";
     html += "<p>Configuration has been updated successfully.</p>";
+    
+    if (wifi_changed) {
+      html += "<p><strong>WiFi settings changed! Device will attempt to reconnect.</strong></p>";
+    }
+    
     html += "<a href='/' style='display:inline-block;margin-top:20px;padding:10px 20px;background:#4CAF50;color:white;text-decoration:none;border-radius:5px;'>Return to Dashboard</a>";
     html += "</div></body></html>";
     
     webServer.send(200, "text/html", html);
     
-    if (webServer.hasArg("wifi_ssid")) {
+    // Check if WiFi settings changed
+    if (wifi_changed) {
+      Serial.println("WiFi credentials changed. Attempting to reconnect...");
+      Serial.println("New SSID: " + config.wifi_ssid);
+      
       #if ENABLE_WIFI
+      // Set flags to trigger WiFi reconnection in main loop
       wifi_connected = false;
-      WiFi.disconnect();
+      wifi_connecting = true;
+      wifi_last_attempt = millis();
+      
+      // Stop web server if in AP mode
+      if (ap_mode) {
+        web_server_active = false;
+        webServer.stop();
+        WiFi.softAPdisconnect(true);
+        ap_mode = false;
+      }
+      
+      // Update display
+      if (wifi_status_label) {
+        lv_label_set_text(wifi_status_label, "WiFi: Reconnecting...");
+        lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFCC00), 0);
+      }
+      
+      // Add a small delay to ensure web response is sent
       delay(100);
       #endif
     }
@@ -1768,10 +2132,20 @@ static void handleTestMusic() {
 }
 
 static void handleReconnectWiFi() {
-  wifi_connected = false;
-  String html = "<html><body><h1>Reconnecting WiFi...</h1>";
-  html += "<p>Attempting to reconnect to WiFi network.</p>";
-  html += "<p><a href='/'>Back to config</a></p></body></html>";
+  reconnectWiFi();
+  
+  String html = "<html><body style='text-align:center;padding:50px;'>";
+  html += "<div style='max-width:500px;margin:auto;background:#f0f0f0;padding:30px;border-radius:10px;'>";
+  html += "<h1 style='color:#4CAF50;'>🔄 WiFi Reconnecting</h1>";
+  html += "<p>Attempting to reconnect to WiFi network...</p>";
+  html += "<p><strong>SSID:</strong> " + config.wifi_ssid + "</p>";
+  html += "<script>";
+  html += "setTimeout(function() {";
+  html += "  window.location.href = '/';";
+  html += "}, 3000);";
+  html += "</script>";
+  html += "</div></body></html>";
+  
   webServer.send(200, "text/html", html);
 }
 
@@ -1835,6 +2209,59 @@ static void handleTestAlarm() {
   html += "<p><a href='/'>Back to config</a></p>";
   html += "</body></html>";
   webServer.send(200, "text/html", html);
+}
+
+static void handleSetManualTime() {
+  if (webServer.hasArg("hour") && webServer.hasArg("minute") && webServer.hasArg("second")) {
+    int hour = webServer.arg("hour").toInt();
+    int minute = webServer.arg("minute").toInt();
+    int second = webServer.arg("second").toInt();
+    bool use_manual_time = webServer.hasArg("use_manual_time") && webServer.arg("use_manual_time") == "1";
+    
+    hour = constrain(hour, 0, 23);
+    minute = constrain(minute, 0, 59);
+    second = constrain(second, 0, 59);
+    
+    setManualTime(hour, minute, second);
+    config.use_manual_time = use_manual_time;
+    saveConfig();
+    
+    String html = "<html><body><h1>Manual Time Set</h1>";
+    html += "<p>Time set to: ";
+    
+    // Format hour with leading zero if needed
+    if (String(hour).length() == 1) {
+      html += "0" + String(hour);
+    } else {
+      html += String(hour);
+    }
+    
+    html += ":";
+    
+    // Format minute with leading zero if needed
+    if (String(minute).length() == 1) {
+      html += "0" + String(minute);
+    } else {
+      html += String(minute);
+    }
+    
+    html += ":";
+    
+    // Format second with leading zero if needed
+    if (String(second).length() == 1) {
+      html += "0" + String(second);
+    } else {
+      html += String(second);
+    }
+    
+    html += "</p>";
+    html += "<p><a href='/'>Back to Dashboard</a></p>";
+    html += "</body></html>";
+    
+    webServer.send(200, "text/html", html);
+  } else {
+    webServer.send(400, "text/plain", "Missing parameters");
+  }
 }
 
 static void handleFactoryReset() {
@@ -2507,6 +2934,7 @@ static void initWebServer() {
   webServer.on("/alarms", handleAlarms);
   webServer.on("/saveAlarm", handleSaveAlarm);
   webServer.on("/deleteAlarm", handleDeleteAlarm);
+  webServer.on("/setManualTime", handleSetManualTime);
   
   webServer.on("/setEmotion", []() {
     if (webServer.hasArg("emotion")) {
@@ -2521,7 +2949,7 @@ static void initWebServer() {
   webServer.on("/status", []() {
     String json = "{";
     json += "\"wifi_connected\":" + String(wifi_connected ? "true" : "false") + ",";
-    json += "\"time_synced\":" + String(time_synced ? "true" : "false") + ",";
+    json += "\"time_synced\":" + String(time_synced || config.use_manual_time ? "true" : "false") + ",";
     json += "\"current_emotion\":" + String(current_emotion) + ",";
     json += "\"battery\":" + String(battery_level) + ",";
     json += "\"brightness\":" + String(config.brightness);
@@ -2581,67 +3009,6 @@ static void stars_draw() {
     else tft.fillRect(xi, yi, 2, 2, col);
   }
   tft.endWrite();
-}
-
-namespace MMA8452Q {
-  uint8_t addr = 0x1D;
-  const uint8_t REG_WHOAMI    = 0x0D;
-  const uint8_t REG_CTRL1     = 0x2A;
-  const uint8_t REG_XYZ_CFG   = 0x0E;
-  const uint8_t REG_OUT_X_MSB = 0x01;
-
-  bool present = false;
-
-  uint8_t read8(uint8_t reg) {
-    Wire.beginTransmission(addr); 
-    Wire.write(reg); 
-    Wire.endTransmission(false);
-    Wire.requestFrom((int)addr, 1);
-    return Wire.available() ? Wire.read() : 0xFF;
-  }
-  
-  void write8(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(addr); 
-    Wire.write(reg); 
-    Wire.write(val); 
-    Wire.endTransmission();
-  }
-
-  bool init() {
-    for (uint8_t a : { (uint8_t)0x1D, (uint8_t)0x1C }) {
-      addr = a;
-      uint8_t who = read8(REG_WHOAMI);
-      if (who == 0x2A) { 
-        present = true; 
-        break; 
-      }
-    }
-    if (!present) return false;
-
-    uint8_t c1 = read8(REG_CTRL1);
-    write8(REG_CTRL1, c1 & ~0x01);
-    write8(REG_XYZ_CFG, 0x00);
-    write8(REG_CTRL1, (c1 & ~(0b111 << 3)) | (0b010 << 3) | 0x01);
-    return true;
-  }
-
-  void read(float &ax_g, float &ay_g, float &az_g) {
-    ax_g=ay_g=az_g=0;
-    if (!present) return;
-    Wire.beginTransmission(addr); 
-    Wire.write(REG_OUT_X_MSB); 
-    Wire.endTransmission(false);
-    Wire.requestFrom((int)addr, 6);
-    if (Wire.available() < 6) return;
-
-    int16_t x = (Wire.read()<<8) | Wire.read();
-    int16_t y = (Wire.read()<<8) | Wire.read();
-    int16_t z = (Wire.read()<<8) | Wire.read();
-
-    x >>= 2; y >>= 2; z >>= 2;
-    const float SCALE = 1.0f / 4096.0f;
-    ax_g = x * SCALE; ay_g = y * SCALE; az_g = z * SCALE;
-  }
 }
 
 static inline float dc_block(float x) {
@@ -2832,7 +3199,8 @@ static void loadAlarms() {
 }
 
 static void checkAlarms() {
-  if (!time_synced || alarm_triggered) return;
+  if (!time_synced && !config.use_manual_time) return;
+  if (alarm_triggered) return;
   
   uint32_t now = millis();
   if (now - last_alarm_check < 60000) return;
@@ -2840,7 +3208,7 @@ static void checkAlarms() {
   last_alarm_check = now;
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;
+  if (!getLocalTime(&timeinfo) && !config.use_manual_time) return;
   
   int current_hour = timeinfo.tm_hour;
   int current_minute = timeinfo.tm_min;
@@ -2868,7 +3236,7 @@ static void triggerAlarm(int alarm_index) {
   Alarm &alarm = alarms[alarm_index];
   
   Serial.println("ALARM TRIGGERED: " + alarm.label);
-  Serial.println("Alarm will ring continuously for " + String(ALARM_RING_DURATION/1000) + " seconds");
+  Serial.println("Alarm will ring continuously for " + String(config.alarm_duration) + " seconds");
   
   if (alarm_label) {
     lv_label_set_text(alarm_label, ("⏰ " + alarm.label).c_str());
@@ -2882,7 +3250,8 @@ static void updateAlarmRinging() {
   if (!alarm_triggered || !alarm_ringing) return;
   
   uint32_t now = millis();
-  if (now - alarm_start_time > ALARM_RING_DURATION) {
+  // Use configurable duration instead of hardcoded value
+  if (now - alarm_start_time > (config.alarm_duration * 1000)) {
     // Alarm has been ringing long enough, stop it
     stopAlarm();
     return;
@@ -3641,6 +4010,31 @@ static void enhancedSetEmotion(Emotion emo, bool withVoice, bool immediate) {
   emotion_stable_since = millis();
 }
 
+// ================== IMPROVED WIFI FUNCTIONS ==================
+static void reconnectWiFi() {
+  Serial.println("Manual WiFi reconnection triggered...");
+  
+  #if ENABLE_WIFI
+  wifi_connected = false;
+  wifi_connecting = true;
+  wifi_last_attempt = millis();
+  
+  // Clear any existing connections
+  WiFi.disconnect();
+  delay(100);
+  
+  // Instead of using WiFiMulti, connect directly
+  if (config.wifi_ssid != "" && config.wifi_password != "") {
+    WiFi.begin(config.wifi_ssid.c_str(), config.wifi_password.c_str());
+  }
+  
+  if (wifi_status_label) {
+    lv_label_set_text(wifi_status_label, "WiFi: Connecting...");
+    lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFCC00), 0);
+  }
+  #endif
+}
+
 #if ENABLE_WIFI
 static void initWiFiNonBlocking() {
   static uint32_t wifi_start_time = 0;
@@ -3648,28 +4042,40 @@ static void initWiFiNonBlocking() {
   
   uint32_t now = millis();
   
-  if (!wifi_init_done) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    
-    if (config.wifi_ssid != "" && config.wifi_password != "") {
-      wifiMulti.addAP(config.wifi_ssid.c_str(), config.wifi_password.c_str());
+  // Check if credentials changed or we need to reconnect
+  if (wifi_connecting || config.wifi_ssid != last_ssid || config.wifi_password != last_password) {
+    if (!wifi_init_done || config.wifi_ssid != last_ssid || config.wifi_password != last_password) {
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+      
+      // Disconnect first
+      WiFi.disconnect();
+      delay(100);
+      
+      if (config.wifi_ssid != "" && config.wifi_password != "") {
+        WiFi.begin(config.wifi_ssid.c_str(), config.wifi_password.c_str());
+        Serial.println("Connecting to WiFi: " + config.wifi_ssid);
+        
+        // Store current credentials
+        last_ssid = config.wifi_ssid;
+        last_password = config.wifi_password;
+      }
+      
+      wifi_start_time = now;
+      wifi_init_done = true;
+      wifi_connecting = true;
+      
+      if (wifi_status_label) {
+        lv_label_set_text(wifi_status_label, "WiFi: Connecting...");
+        lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFCC00), 0);
+      }
+      
+      return;
     }
-    
-    wifi_start_time = now;
-    wifi_init_done = true;
-    wifi_connecting = true;
-    
-    if (wifi_status_label) {
-      lv_label_set_text(wifi_status_label, "WiFi: Connecting...");
-      lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFCC00), 0);
-    }
-    
-    return;
   }
   
   if (wifi_connecting) {
-    if (wifiMulti.run() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED) {
       wifi_connected = true;
       wifi_connecting = false;
       ap_mode = false;
@@ -3682,14 +4088,28 @@ static void initWiFiNonBlocking() {
         lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x33FF99), 0);
       }
       
+      // Play success sound
+      if (i2s_spk_init_success) {
+        playTone(523, 100, 0.3f);
+        delay(50);
+        playTone(659, 100, 0.3f);
+        delay(50);
+        playTone(784, 200, 0.3f);
+      }
+      
       initWebServer();
-      initTime();
+      if (!config.use_manual_time) {
+        initTime();
+      }
     }
     else if (now - wifi_start_time > WIFI_CONNECT_TIMEOUT) {
       wifi_connecting = false;
       
       #if ENABLE_WEB_SERVER
-      startAPMode();
+      // Only start AP mode if we have web server enabled
+      if (!ap_mode && !web_server_active) {
+        startAPMode();
+      }
       #else
       if (wifi_status_label) {
         lv_label_set_text(wifi_status_label, "WiFi: Failed");
@@ -3723,7 +4143,7 @@ static void reconnectWiFiIfNeeded() {
 
 #if ENABLE_TIME_FEATURES
 static void initTime() {
-  if (!wifi_connected) return;
+  if (!wifi_connected || config.use_manual_time) return;
   
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, 
              NTP_SERVER1, NTP_SERVER2, NTP_SERVER3);
@@ -3744,28 +4164,45 @@ static void initTime() {
 // ================== TIME FUNCTIONS ==================
 #if ENABLE_TIME_FEATURES
 static int getCurrentHour() {
-  if (!time_synced) return -1;
+  if (!time_synced && !config.use_manual_time) return config.manual_hour;
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return -1;
+  if (!getLocalTime(&timeinfo)) return config.manual_hour;
   
   return timeinfo.tm_hour;
 }
 
 static int getCurrentMinute() {
-  if (!time_synced) return -1;
+  if (!time_synced && !config.use_manual_time) return config.manual_minute;
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return -1;
+  if (!getLocalTime(&timeinfo)) return config.manual_minute;
   
   return timeinfo.tm_min;
 }
 
-static String getCurrentTimeString() {
-  if (!time_synced) return "--:--:--";
+static int getCurrentSecond() {
+  if (!time_synced && !config.use_manual_time) return config.manual_second;
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "Time Error";
+  if (!getLocalTime(&timeinfo)) return config.manual_second;
+  
+  return timeinfo.tm_sec;
+}
+
+static String getCurrentTimeString() {
+  if (!time_synced && !config.use_manual_time) {
+    char timeStr[9];
+    sprintf(timeStr, "%02d:%02d:%02d", config.manual_hour, config.manual_minute, config.manual_second);
+    return String(timeStr);
+  }
+  
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    char timeStr[9];
+    sprintf(timeStr, "%02d:%02d:%02d", config.manual_hour, config.manual_minute, config.manual_second);
+    return String(timeStr);
+  }
   
   char timeStr[9];
   strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
@@ -3774,18 +4211,16 @@ static String getCurrentTimeString() {
 #endif
 
 static void updateTimeDisplay() {
-  if (time_label && time_synced) {
+  if (time_label) {
     lv_label_set_text(time_label, getCurrentTimeString().c_str());
   }
 }
 
 static void checkSleepSchedule() {
-  if (!time_synced) return;
+  if (!time_synced && !config.use_manual_time) return;
   
   int current_hour = getCurrentHour();
   int current_minute = getCurrentMinute();
-  
-  if (current_hour == -1) return;
   
   bool should_sleep = (current_hour >= SLEEP_HOUR) || (current_hour < WAKE_HOUR);
   
@@ -3925,7 +4360,7 @@ static void calibrateAccelerometerZero() {
   
   for (int i = 0; i < samples; i++) {
     float ax, ay, az;
-    MMA8452Q::read(ax, ay, az);
+    readAccelerometer(ax, ay, az);
     sum_x += ax;
     sum_y += ay;
     sum_z += az;
@@ -4083,11 +4518,22 @@ void setup() {
 
   stars_init();
   
+  // FIXED I2C INITIALIZATION WITH INTERFERENCE REDUCTION
   Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // Increase I2C clock speed for better performance
+  Wire.setTimeOut(100);  // Set timeout to prevent hanging
+  
+  // Add a small delay for I2C bus stabilization
+  delay(100);
+  
   if (!MMA8452Q::init()) {
     Serial.println("MMA8452Q not found!");
   } else {
     Serial.println("MMA8452Q initialized");
+    
+    // Configure MMA8452Q for lower noise
+    MMA8452Q::write8(0x2A, 0x18); // Set data rate to 50Hz, reduced noise
+    delay(10);
   }
   
   i2s_mic_init();
@@ -4212,12 +4658,17 @@ void loop() {
   #endif
 
   if (!calibration_mode) {
-    if (now - lastAccelUpdate >= 10) {
+    if (now - lastAccelUpdate >= 20) { // Changed from 10ms to 20ms to reduce WiFi interference frequency
       lastAccelUpdate = now;
       
       if (MMA8452Q::present) {
         float ax, ay, az;
-        MMA8452Q::read(ax, ay, az);
+        
+        // FIXED: Use the new readAccelerometer function with retry logic
+        if (!readAccelerometer(ax, ay, az)) {
+          // If read fails, skip this update
+          return;
+        }
         
         // Apply calibration offsets
         if (accel_calibrated) {
@@ -4226,32 +4677,56 @@ void loop() {
           az -= accel_zero_z;
         }
         
+        // FIXED: Add low-pass filter to smooth readings
+        static float filtered_ax = 0, filtered_ay = 0, filtered_az = 0;
+        const float filter_factor = 0.3f; // Lower = smoother but slower response
+        
+        filtered_ax = filtered_ax * (1.0f - filter_factor) + ax * filter_factor;
+        filtered_ay = filtered_ay * (1.0f - filter_factor) + ay * filter_factor;
+        filtered_az = filtered_az * (1.0f - filter_factor) + az * filter_factor;
+        
+        // Use filtered values
+        ax = filtered_ax;
+        ay = filtered_ay;
+        az = filtered_az;
+        
         // UPDATED PUPIL MOVEMENT FOR NEW ORIENTATION
         // X axis (top/bottom) controls vertical pupil movement
         // Y axis (left/right) controls horizontal pupil movement
         int dx = (int)(-ay * 12.0f);  // Use Y axis for horizontal movement
         int dy = (int)(-ax * 10.0f);  // Use X axis for vertical movement (inverted)
         
-        if (abs(dx) < 2) dx = 0;
-        if (abs(dy) < 2) dy = 0;
+        // FIXED: Add deadzone to prevent jitter
+        if (abs(dx) < 3) dx = 0; // Increased from 2 to 3
+        if (abs(dy) < 3) dy = 0; // Increased from 2 to 3
         
         dx = constrain(dx, -20, 20);
         dy = constrain(dy, -15, 15);
         
-        eyeL.setTarget(dx, dy);
-        eyeR.setTarget(dx, dy);
+        // FIXED: Add smoothing to target movements
+        static int smoothed_dx = 0, smoothed_dy = 0;
+        const float move_filter = 0.4f; // Smooth movement changes
+        
+        smoothed_dx = (int)(smoothed_dx * (1.0f - move_filter) + dx * move_filter);
+        smoothed_dy = (int)(smoothed_dy * (1.0f - move_filter) + dy * move_filter);
+        
+        eyeL.setTarget(smoothed_dx, smoothed_dy);
+        eyeR.setTarget(smoothed_dx, smoothed_dy);
         
         // Z axis (forward/backward) controls pupil size
-        // When leaning forward (Z positive), pupils get smaller
-        // When leaning backward (Z negative), pupils get larger
         int pupil_adjust = (int)((az + 1.0f) * 6.0f);  // Z ranges from -1 to +1
         pupil_adjust = constrain(pupil_adjust, -6, 6);
         
         int base_size = 12;
         int new_size = base_size + pupil_adjust;
         new_size = constrain(new_size, 8, 20);
-        eyeL.setPupilSize(new_size, new_size);
-        eyeR.setPupilSize(new_size, new_size);
+        
+        // Smooth pupil size changes
+        static int smoothed_size = 12;
+        smoothed_size = (int)(smoothed_size * 0.7f + new_size * 0.3f);
+        
+        eyeL.setPupilSize(smoothed_size, smoothed_size);
+        eyeR.setPupilSize(smoothed_size, smoothed_size);
 
         #if ENABLE_GESTURES
         static uint32_t last_gesture_check = 0;
@@ -4433,12 +4908,7 @@ void loop() {
         
       case 'r':
         #if ENABLE_WIFI
-        WiFi.disconnect();
-        delay(100);
-        WiFi.mode(WIFI_STA);
-        wifi_connected = false;
-        wifi_connecting = true;
-        wifi_last_attempt = millis();
+        reconnectWiFi();
         Serial.println("WiFi reconnecting...");
         #endif
         break;
@@ -4471,7 +4941,7 @@ void loop() {
         
       case 'A':
         triggerAlarm(0);
-        Serial.println("Test alarm triggered - will ring for 30 seconds");
+        Serial.println("Test alarm triggered - will ring for " + String(config.alarm_duration) + " seconds");
         break;
         
       case 'S':
